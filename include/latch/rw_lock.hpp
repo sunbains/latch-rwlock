@@ -26,7 +26,9 @@
 #include <chrono>
 #include <concepts>
 #include <cstdint>
+#include <cstdlib>
 #include <new>
+#include <system_error>
 
 #include "latch/latch_mutex.hpp"
 #include "latch/futex.hpp"
@@ -633,9 +635,16 @@ class RwLock {
   RwLock(const RwLock&) = LATCH_DELETE("a lock has identity");
   RwLock& operator=(const RwLock&) = LATCH_DELETE("a lock has identity");
 
-  void lock() noexcept { (void)m_core->write_acquire(current_thread()); }
+  // Throw std::system_error (resource_deadlock_would_occur) if this thread already
+  // holds the lock in a way that cannot nest. Nothing is acquired, what the thread held
+  // is unchanged, and a guard being constructed does not end up owning anything.
+  void lock() {
+    if (m_core->write_acquire(current_thread()) != 0) [[unlikely]] throw_self_deadlock();
+  }
   void unlock() noexcept { (void)m_core->release(current_thread()); }
-  void lock_shared() noexcept { (void)m_core->read_acquire(current_thread()); }
+  void lock_shared() {
+    if (m_core->read_acquire(current_thread()) != 0) [[unlikely]] throw_self_deadlock();
+  }
   void unlock_shared() noexcept { (void)m_core->release(current_thread()); }
   [[nodiscard]] bool try_lock() noexcept { return m_core->try_write_acquire(current_thread()) == 0; }
   [[nodiscard]] bool try_lock_shared() noexcept { return m_core->try_read_acquire(current_thread()) == 0; }
@@ -660,6 +669,16 @@ class RwLock {
   [[nodiscard]] RwLockCore& core() noexcept { return *m_core; }
 
  private:
+  [[noreturn, gnu::cold, gnu::noinline]] static void throw_self_deadlock() {
+#if defined(__cpp_exceptions)
+    throw std::system_error(std::make_error_code(std::errc::resource_deadlock_would_occur));
+#else
+    // Built without exceptions, nothing can carry the error. As libstdc++ does here.
+    diagnostic("Fatal: thread already holds this latch::RwLock\n");
+    std::abort();
+#endif
+  }
+
   // Ticket queues cannot be abandoned, so timed acquisition polls the try path.
   template <class TimePoint>
   static bool poll_until(const TimePoint& deadline, std::predicate auto attempt) noexcept {

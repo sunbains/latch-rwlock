@@ -18,6 +18,7 @@
 #include <print>
 #include <shared_mutex>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -118,7 +119,81 @@ void progress_check(Lock& lock, unsigned thread_count) {
   CHECK(finished.load() == thread_count);
 }
 
+bool refused_as_deadlock(auto attempt) {
+  try {
+    attempt();
+  } catch (const std::system_error& error) {
+    return error.code() == std::errc::resource_deadlock_would_occur;
+  }
+  return false;
+}
+
+void test_self_deadlock(latch::RwLock& lock) {
+  const auto others_can = [&](auto attempt) {
+    bool result = false;
+    std::thread([&] { result = attempt(); }).join();
+    return result;
+  };
+  const auto try_read = [&] {
+    const bool taken = lock.try_lock_shared();
+    if (taken) lock.unlock_shared();
+    return taken;
+  };
+  const auto try_write = [&] {
+    const bool taken = lock.try_lock();
+    if (taken) lock.unlock();
+    return taken;
+  };
+
+  // Direct calls.
+  lock.lock();
+  CHECK(refused_as_deadlock([&] { lock.lock(); }));
+  CHECK(refused_as_deadlock([&] { lock.lock_shared(); }));
+  CHECK(!others_can(try_read));  // the refusals left the write lock in place
+  lock.unlock();
+  CHECK(others_can(try_write));
+
+  lock.lock_shared();
+  CHECK(refused_as_deadlock([&] { lock.lock(); }));
+  CHECK(others_can(try_read));
+  CHECK(!others_can(try_write));  // the refusal left the read lock in place
+  lock.unlock_shared();
+  CHECK(others_can(try_write));
+
+  // Guards: a refused inner guard must not release what the outer one holds.
+  {
+    std::unique_lock outer(lock);
+    CHECK(refused_as_deadlock([&] { std::unique_lock inner(lock); }));
+    CHECK(refused_as_deadlock([&] { std::shared_lock inner(lock); }));
+    CHECK(refused_as_deadlock([&] { std::lock_guard inner(lock); }));
+    CHECK(outer.owns_lock());
+    CHECK(!others_can(try_read));
+  }
+  CHECK(others_can(try_write));
+  {
+    std::shared_lock outer(lock);
+    CHECK(refused_as_deadlock([&] { std::unique_lock inner(lock); }));
+    CHECK(outer.owns_lock());
+    CHECK(others_can(try_read));
+    CHECK(!others_can(try_write));
+    {
+      std::shared_lock nested(lock);  // allowed
+      CHECK(nested.owns_lock());
+    }
+    CHECK(!others_can(try_write));
+  }
+  CHECK(others_can(try_write));
+}
+
 void test_native() {
+  std::println("native: self-deadlock throws, directly and through guards");
+  {
+    latch::RwLock adaptive;
+    test_self_deadlock(adaptive);
+    latch::RwLock no_fast_reads{latch::ExpectedWrites{100}};
+    test_self_deadlock(no_fast_reads);
+  }
+
   std::println("native: guards");
   {
     latch::RwLock lock;

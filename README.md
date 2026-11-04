@@ -17,7 +17,12 @@ void writer() { std::unique_lock guard(lock); /* ... */ }
 ```
 
 `RwLock` meets the *SharedTimedMutex* requirements. Read locks may be nested, even
-with a writer waiting.
+with a writer waiting. Other nesting is refused: `lock()` or `lock_shared()` by a thread
+holding the write lock, or `lock()` by a thread holding a read lock, throws
+`std::system_error` with `std::errc::resource_deadlock_would_occur`. Nothing is acquired
+and what the thread held is unchanged, so this is safe through `std::unique_lock`,
+`std::shared_lock` and `std::lock_guard`. The `try_` forms return `false` instead. Code
+built with `-fno-exceptions` has no way to carry the error, so there the same misuse aborts.
 
 By default a lock adjusts itself to the mix of reads and writes it observes. To fix its
 behavior instead, give the expected share of writes as a percentage:
