@@ -600,7 +600,7 @@ class alignas(coherence_unit) RwLockCore {
   std::atomic<std::uint32_t> m_bias_allowed{1};
   std::atomic<LoadProfile> m_profile{LoadProfile::read_mostly};
 
-  LatchMutex m_write_mutex;
+  Mutex m_write_mutex;
 
   // Write mutex holder only.
   alignas(coherence_unit) std::uint64_t m_sample_began = 0;

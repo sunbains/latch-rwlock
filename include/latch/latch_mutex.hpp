@@ -105,7 +105,7 @@ inline void park_for_ticket(const std::atomic<std::uint32_t>& grant,
   parked.fetch_sub(1, std::memory_order_relaxed);
 }
 
-class LatchMutex {
+class Mutex {
  public:
   // Returns true if the acquisition had to wait or came via local hand-off.
   bool lock(NodeTicketLock& local) noexcept {
