@@ -35,7 +35,7 @@ class alignas(coherence_unit) Runtime {
   int m_cpu_count = 1;
   int m_run_bound = 100;        // RunBound: fairness limit on local hand-off
   int m_patience = 2000;        // Patience: nominal pauses before parking; <0 spins
-  std::uint32_t m_admission_limit = 6;  // AdmissionLimit: queue depth per node; 0 disables
+  std::uint32_t m_admission_limit = 8;  // AdmissionLimit: queue depth per node; 0 disables
   int m_expected_writes = -1;    // ExpectedWrites: 0-100 fixes the profile; <0 is automatic
   std::uint32_t m_pause_q8 = 256;
   std::uint32_t m_patience_pauses = 0;
@@ -369,7 +369,7 @@ inline void initialize_runtime() noexcept {
   runtime.m_run_bound = eval_key("RunBound", runtime.m_run_bound);
   runtime.m_patience = eval_key("Patience", runtime.m_patience);
   runtime.m_bias_multiplier = static_cast<std::uint32_t>(eval_key("BiasMultiplier", 9));
-  runtime.m_admission_limit = static_cast<std::uint32_t>(eval_key("AdmissionLimit", 6));
+  runtime.m_admission_limit = static_cast<std::uint32_t>(eval_key("AdmissionLimit", 8));
   if (runtime.m_patience < 0) runtime.m_admission_limit = 0;  // pure spinning requested
   runtime.m_expected_writes = eval_key("ExpectedWrites", -1);
   const int restriction_mask = eval_key("NodeRestrictionMask", -1);

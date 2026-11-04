@@ -126,7 +126,7 @@ Environment variables, read once at start-up:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `AdmissionLimit` | 6 | Queue depth per node before threads sleep. 0 disables. |
+| `AdmissionLimit` | 8 | Queue depth per node before threads sleep. 0 disables. |
 | `ExpectedWrites` | automatic | 0-100 fixes every lock's profile from this write percentage. For programs using `LD_PRELOAD`, which cannot use the constructor. |
 | `Patience` | 2000 | Nominal pauses without progress before parking. Negative spins forever. |
 | `RunBound` | 100 | Local hand-offs before ceding to another node. |

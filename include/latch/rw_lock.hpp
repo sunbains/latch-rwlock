@@ -333,8 +333,10 @@ class alignas(coherence_unit) RwLockCore {
     } else if (percent >= mixed_enter_percent && current == LoadProfile::read_mostly) {
       next = LoadProfile::mixed;
     }
-    // With more threads than CPUs, waiters must get off the CPU whatever the mix.
-    if (bias_table.rows_in_use() > static_cast<std::size_t>(runtime.m_cpu_count)) next = LoadProfile::read_mostly;
+    // With clearly more threads than CPUs, waiters must get off the CPU whatever the
+    // mix. The margin matters: one thread per CPU plus an idle main thread is not that.
+    const auto cpus = static_cast<std::size_t>(runtime.m_cpu_count);
+    if (bias_table.rows_in_use() > cpus + cpus / 4) next = LoadProfile::read_mostly;
     if (next != current) {
       m_profile.store(next, std::memory_order_relaxed);
       apply_profile(next);
