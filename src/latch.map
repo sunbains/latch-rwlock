@@ -1,0 +1,8 @@
+{
+  global:
+    pthread_rwlock_*;
+    __pthread_rwlock_*;
+    pthread_rwlockattr_*;
+  local:
+    *;
+};
