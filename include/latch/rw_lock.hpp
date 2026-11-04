@@ -29,7 +29,9 @@
 #include <cstdlib>
 #include <new>
 #include <system_error>
+#include <type_traits>
 
+#include "latch/fwd.hpp"
 #include "latch/latch_mutex.hpp"
 #include "latch/futex.hpp"
 #include "latch/reader_indicator.hpp"
@@ -78,12 +80,20 @@ inline constexpr std::uint32_t heavy_leave_percent = 20;
 inline constexpr std::uint64_t sample_interval_cycles = 25'000'000;
 inline constexpr std::uint32_t sample_write_interval = 256;
 
+// Write levels live in the spare bits of RecursiveRwLock's word. Past this, nesting is
+// refused, as more would overwrite the pointer.
+inline constexpr std::uint32_t max_write_nesting = 1024;
+
 enum class LockMode : std::uint32_t {
   reading = 0,
   writer_resolving = 2,  // stays set across a stream of writers: they skip the drain
 };
 
+template <Order order>
 class alignas(coherence_unit) RwLockCore {
+  using Mutex = MutexFor<order>;
+  static constexpr PoolKind pool_kind = order == Order::fifo ? PoolKind::fifo_lock_core : PoolKind::barging_lock_core;
+
  public:
   RwLockCore() noexcept {
     if (runtime.m_expected_writes >= 0) {
@@ -95,6 +105,7 @@ class alignas(coherence_unit) RwLockCore {
     for (int node = 0; node < runtime.m_node_count; ++node) {
       m_nodes[node] = new (pool_allocate(PoolKind::node_state, sizeof(NodeState), node)) NodeState{};
       m_nodes[node]->m_ticket.m_local_limit = runtime.m_run_bound;
+      m_nodes[node]->m_ticket.m_node_index = static_cast<std::uint32_t>(node);
     }
     constinit static std::atomic<std::uint32_t> next_column{0};
     m_bias_column = next_column.fetch_add(1, std::memory_order_relaxed) % bias_columns;
@@ -118,11 +129,11 @@ class alignas(coherence_unit) RwLockCore {
 
   [[nodiscard]] static RwLockCore* create() noexcept {
     ensure_runtime();
-    return new (pool_allocate(PoolKind::lock_core, allocation_size())) RwLockCore{};
+    return new (pool_allocate(pool_kind, allocation_size())) RwLockCore{};
   }
   [[nodiscard]] static RwLockCore* create(ExpectedWrites expected) noexcept {
     ensure_runtime();
-    return new (pool_allocate(PoolKind::lock_core, allocation_size())) RwLockCore{expected};
+    return new (pool_allocate(pool_kind, allocation_size())) RwLockCore{expected};
   }
 
   // Total memory of one lock, including its per-node state.
@@ -137,7 +148,7 @@ class alignas(coherence_unit) RwLockCore {
   [[nodiscard]] bool is_adaptive() const noexcept { return m_adaptive; }
   static void dispose(RwLockCore* core) noexcept {
     core->~RwLockCore();
-    pool_release(PoolKind::lock_core, core);
+    pool_release(pool_kind, core);
   }
 
   // Returns 0 or EDEADLK.
@@ -197,8 +208,8 @@ class alignas(coherence_unit) RwLockCore {
     }
     if (m_bias.load(std::memory_order_relaxed) != 0) revoke_bias();
     if (m_adaptive && (++m_write_mutex.m_holder.m_writes % sample_write_interval) == 0) [[unlikely]] sample_load();
-    LATCH_CLAIM(m_writer_active.load(std::memory_order_relaxed) == 0);
-    m_writer_active.store(reinterpret_cast<std::uintptr_t>(&self), std::memory_order_relaxed);
+    LATCH_CLAIM(m_writer_active.load(std::memory_order_relaxed) == nullptr);
+    m_writer_active.store(&self, std::memory_order_relaxed);
     return 0;
   }
 
@@ -215,7 +226,10 @@ class alignas(coherence_unit) RwLockCore {
         if (held == nullptr && m_bias.load(std::memory_order_relaxed) != 0) {
           slot.store(this, std::memory_order_relaxed);
           publish_fence();
-          if (m_bias.load(std::memory_order_acquire) != 0) return 0;
+          if (m_bias.load(std::memory_order_acquire) != 0) {
+            count_read(*row);
+            return 0;
+          }
           slot.store(nullptr, std::memory_order_relaxed);
         }
       }
@@ -257,7 +271,7 @@ class alignas(coherence_unit) RwLockCore {
         return EBUSY;
       }
     }
-    m_writer_active.store(reinterpret_cast<std::uintptr_t>(&self), std::memory_order_relaxed);
+    m_writer_active.store(&self, std::memory_order_relaxed);
     return 0;
   }
 
@@ -271,22 +285,14 @@ class alignas(coherence_unit) RwLockCore {
   }
 
   [[nodiscard]] bool is_write_holder(const ThreadState& self) const noexcept {
-    return m_writer_active.load(std::memory_order_relaxed) ==
-           reinterpret_cast<std::uintptr_t>(&self);
+    return m_writer_active.load(std::memory_order_relaxed) == &self;
   }
 
   // Advisory check for destroy. Races can only make it report "busy" spuriously.
   [[nodiscard]] bool is_quiescent() const noexcept {
-    if (m_writer_active.load(std::memory_order_relaxed) != 0 || m_write_mutex.is_locked()) return false;
+    if (m_writer_active.load(std::memory_order_relaxed) != nullptr || m_write_mutex.is_locked()) return false;
     if (any_indicator_busy()) return false;
-    if (bias_compiled && runtime.m_bias_enabled) {
-      const std::size_t rows = bias_table.high_water();
-      for (std::size_t index = 0; index < rows; ++index) {
-        if (bias_table.row(index).m_slots[m_bias_column].load(std::memory_order_acquire) == this) {
-          return false;
-        }
-      }
-    }
+    if (bias_compiled && runtime.m_bias_enabled && !no_visible_readers()) return false;
     return true;
   }
 
@@ -373,7 +379,11 @@ class alignas(coherence_unit) RwLockCore {
     if constexpr (parking_compiled) {
       // Clearing before waking closes the window where the writer has checked the
       // count but not yet slept: its futex_wait then fails on the changed flag.
-      if (m_drain_parked.load(std::memory_order_relaxed) != 0 &&
+      // Seq-cst: this load must not pass the increment above, or the writer can miss the
+      // departure while this misses the flag, and the writer sleeps with no timeout.
+      // The increment can already have let the lock be destroyed and its memory reused, so
+      // this can clear a new lock's flag. That writer wakes early, rechecks and sleeps again.
+      if (m_drain_parked.load(std::memory_order_seq_cst) != 0 &&
           m_drain_parked.exchange(0, std::memory_order_seq_cst) != 0) [[unlikely]] {
         futex_wake_all(m_drain_parked);
       }
@@ -391,6 +401,15 @@ class alignas(coherence_unit) RwLockCore {
 
     ReaderIndicator& readers = m_nodes[memo.m_node]->m_readers;
     for (;;) {
+      // The mode may just be left over from a finished writer. A reader alone can then open
+      // the lock itself, which takes far fewer atomics than forming a group of one.
+      if (m_mode.load(std::memory_order_relaxed) != LockMode::reading &&
+          m_read_arrive.load(std::memory_order_relaxed) == 0 && m_write_mutex.try_lock(local_ticket())) {
+        m_mode.store(LockMode::reading, std::memory_order_release);
+        fetch_increment(readers.m_ingress);
+        m_write_mutex.unlock();
+        break;
+      }
       fetch_increment(readers.m_ingress);
       if (m_mode.load(std::memory_order_seq_cst) == LockMode::reading) break;
 
@@ -462,23 +481,12 @@ class alignas(coherence_unit) RwLockCore {
   [[gnu::noinline]] int release_slow(ThreadState& self) noexcept {
     // A thread with write permission excludes all readers, so an active writer
     // means the caller is that writer.
-    const std::uintptr_t writer = m_writer_active.load(std::memory_order_relaxed);
-    if (writer != 0) {
-      if (writer != reinterpret_cast<std::uintptr_t>(&self) && runtime.m_warn) {
-        diagnostic("Warning: T%u unlocking %p write-locked by another thread\n", self.m_unique_id,
-                   static_cast<void*>(this));
-      }
+    if (m_writer_active.load(std::memory_order_relaxed) != nullptr) {
       write_release();
       return 0;
     }
     ReadMemo* const memo = self.find_memo(this);
-    if (memo == nullptr) {
-      if (runtime.m_warn) {
-        diagnostic("Warning: T%u unlocking %p but holds no permission\n", self.m_unique_id,
-                   static_cast<void*>(this));
-      }
-      return EPERM;
-    }
+    if (memo == nullptr) return EPERM;
     LATCH_CLAIM(memo->m_count != 0);
     if (--memo->m_count != 0) return 0;
     const bool owes_mutex = memo->m_holds_write_mutex;
@@ -494,14 +502,7 @@ class alignas(coherence_unit) RwLockCore {
   }
 
   void write_release() noexcept {
-    m_writer_active.store(0, std::memory_order_relaxed);
-    if constexpr (eager_reopen_compiled) {
-      // Nobody queued: leaving the mode set would send the next reader through the
-      // write mutex. A writer arriving just after this pays only a drain.
-      if (!m_write_mutex.has_waiters()) {
-        m_mode.store(LockMode::reading, std::memory_order_release);
-      }
-    }
+    m_writer_active.store(nullptr, std::memory_order_relaxed);
     m_write_mutex.unlock();
   }
 
@@ -584,15 +585,22 @@ class alignas(coherence_unit) RwLockCore {
     inhibit_bias(began);
   }
 
+  [[nodiscard]] bool no_visible_readers() const noexcept {
+    const std::size_t rows = bias_table.high_water();
+    for (std::size_t index = 0; index < rows; ++index) {
+      if (bias_table.row(index).m_slots[m_bias_column].load(std::memory_order_acquire) == this) return false;
+    }
+    return true;
+  }
+
   [[nodiscard]] bool try_revoke_bias() noexcept {
     if (m_bias.load(std::memory_order_relaxed) == 0) return true;
+    // A reader in plain view: fail without the fence, which interrupts every running
+    // thread and would otherwise be paid on each retry of a timed acquisition.
+    if (!no_visible_readers()) return false;
     const std::uint64_t began = read_clock();
     close_bias_and_fence();
-    const std::size_t rows = bias_table.high_water();
-    bool clear = true;
-    for (std::size_t index = 0; index < rows && clear; ++index) {
-      clear = bias_table.row(index).m_slots[m_bias_column].load(std::memory_order_acquire) != this;
-    }
+    const bool clear = no_visible_readers();
     inhibit_bias(began);
     // A reader is still in its slot, so writers must keep scanning for it. Writers decide
     // whether to scan from the bias, and we still hold the write mutex.
@@ -605,7 +613,7 @@ class alignas(coherence_unit) RwLockCore {
 
   // Every reader reads this unit; writers write it. Readers only need it to be
   // current when a writer has been through, at which point they miss regardless.
-  alignas(light_unit) std::atomic<std::uintptr_t> m_writer_active{0};
+  alignas(light_unit) std::atomic<const ThreadState*> m_writer_active{nullptr};
   std::atomic<LockMode> m_mode{LockMode::reading};
   std::atomic<std::uint32_t> m_bias{0};
   std::atomic<std::uint32_t> m_drain_parked{0};
@@ -621,78 +629,171 @@ class alignas(coherence_unit) RwLockCore {
   alignas(light_unit) std::atomic<std::uint32_t> m_read_depart{0};
   std::atomic<std::uint32_t> m_depart_parked{0};
 
-  // Must stay last: its grant slots follow it in memory.
+  // Must stay last: FifoMutex's grant slots follow it in memory.
   Mutex m_write_mutex;
 };
 
 // Native interface. Meets the SharedTimedMutex requirements, so std::unique_lock
-// and std::shared_lock work. The object is one pointer; the state it refers to is
+// and std::shared_lock work. The object is one word; the state it refers to is
 // type-stable, which makes destroying the lock right after an unlock safe.
-class RwLock {
+template <Recursion recursion, Order order>
+class BasicRwLock {
+  using Core = RwLockCore<order>;
+
  public:
   // Adjusts itself to the observed mix of reads and writes.
-  RwLock() noexcept : m_core(RwLockCore::create()) {}
+  BasicRwLock() noexcept : m_core(pack(Core::create())) {}
   // Fixed configuration, no adjustment: RwLock lock{ExpectedWrites{50}};
-  explicit RwLock(ExpectedWrites expected) noexcept : m_core(RwLockCore::create(expected)) {}
-  ~RwLock() { RwLockCore::dispose(m_core); }
-  RwLock(const RwLock&) = LATCH_DELETE("a lock has identity");
-  RwLock& operator=(const RwLock&) = LATCH_DELETE("a lock has identity");
+  explicit BasicRwLock(ExpectedWrites expected) noexcept : m_core(pack(Core::create(expected))) {}
+  ~BasicRwLock() { Core::dispose(core_ptr()); }
+  BasicRwLock(const BasicRwLock&) = LATCH_DELETE("a lock has identity");
+  BasicRwLock& operator=(const BasicRwLock&) = LATCH_DELETE("a lock has identity");
 
-  // Throw std::system_error (resource_deadlock_would_occur) if this thread already
-  // holds the lock in a way that cannot nest. Nothing is acquired, what the thread held
-  // is unchanged, and a guard being constructed does not end up owning anything.
+  // Throw std::system_error if this thread already holds the lock in a way that cannot
+  // nest (resource_deadlock_would_occur), or at the limit on nesting
+  // (resource_unavailable_try_again). Nothing is acquired, what the thread held is
+  // unchanged, and a guard being constructed does not end up owning anything.
   void lock() {
-    if (m_core->write_acquire(current_thread()) != 0) [[unlikely]] throw_self_deadlock();
+    ThreadState& self = current_thread();
+    if (nest_write(self)) return;
+    const int status = core_ptr()->write_acquire(self);
+    if (status != 0) [[unlikely]] {
+      throw_refused(is_recursive && core_ptr()->is_write_holder(self) ? EAGAIN : status);
+    }
   }
-  void unlock() noexcept { (void)m_core->release(current_thread()); }
+  void unlock() noexcept {
+    if constexpr (is_recursive) {
+      const std::uintptr_t word = m_core.load(std::memory_order_relaxed);
+      if ((word >> depth_shift) != 0) {
+        m_core.store(word - one_level, std::memory_order_relaxed);
+      } else {
+        (void)core_of(word)->release(current_thread());
+      }
+    } else {
+      (void)m_core->release(current_thread());
+    }
+  }
   void lock_shared() {
-    if (m_core->read_acquire(current_thread()) != 0) [[unlikely]] throw_self_deadlock();
+    const int status = core_ptr()->read_acquire(current_thread());
+    if (status != 0) [[unlikely]] throw_refused(status);
   }
-  void unlock_shared() noexcept { (void)m_core->release(current_thread()); }
-  [[nodiscard]] bool try_lock() noexcept { return m_core->try_write_acquire(current_thread()) == 0; }
-  [[nodiscard]] bool try_lock_shared() noexcept { return m_core->try_read_acquire(current_thread()) == 0; }
+  // As unlock(): the core releases whichever this thread holds.
+  void unlock_shared() noexcept { unlock(); }
+  [[nodiscard]] bool try_lock() noexcept {
+    ThreadState& self = current_thread();
+    return nest_write(self) || core_ptr()->try_write_acquire(self) == 0;
+  }
+  [[nodiscard]] bool try_lock_shared() noexcept { return core_ptr()->try_read_acquire(current_thread()) == 0; }
 
   template <class Clock, class Duration>
   [[nodiscard]] bool try_lock_until(const std::chrono::time_point<Clock, Duration>& deadline) noexcept {
-    return poll_until(deadline, [this] { return try_lock(); });
+    return poll_until(deadline, [this] { return try_lock(); },
+                      [this] { return core_ptr()->held_by(current_thread()); });
   }
   template <class Clock, class Duration>
   [[nodiscard]] bool try_lock_shared_until(const std::chrono::time_point<Clock, Duration>& deadline) noexcept {
-    return poll_until(deadline, [this] { return try_lock_shared(); });
+    return poll_until(deadline, [this] { return try_lock_shared(); },
+                      [this] { return core_ptr()->is_write_holder(current_thread()); });
   }
   template <class Rep, class Period>
   [[nodiscard]] bool try_lock_for(const std::chrono::duration<Rep, Period>& timeout) noexcept {
-    return try_lock_until(std::chrono::steady_clock::now() + timeout);
+    return try_lock_until(deadline_after(timeout));
   }
   template <class Rep, class Period>
   [[nodiscard]] bool try_lock_shared_for(const std::chrono::duration<Rep, Period>& timeout) noexcept {
-    return try_lock_shared_until(std::chrono::steady_clock::now() + timeout);
+    return try_lock_shared_until(deadline_after(timeout));
   }
 
-  [[nodiscard]] RwLockCore& core() noexcept { return *m_core; }
+  [[nodiscard]] Core& core() noexcept { return *core_ptr(); }
 
  private:
-  [[noreturn, gnu::cold, gnu::noinline]] static void throw_self_deadlock() {
+  static constexpr bool is_recursive = recursion == Recursion::write;
+
+  // With recursion, the top bits of the core pointer hold the levels beyond the first, so
+  // the lock stays one word. Only the holder changes them. The word is atomic because
+  // readers load the pointer bits meanwhile; those never change. User addresses fit: mmap
+  // stays below 2^47 unless asked to go higher, and pack() checks.
+  static_assert(!is_recursive || sizeof(std::uintptr_t) == 8);
+  static constexpr int depth_shift = 54;
+  static constexpr std::uint64_t one_level = std::uint64_t{1} << depth_shift;
+  static_assert(max_write_nesting - 1 < (std::uint64_t{1} << (64 - depth_shift)));
+
+  using Word = std::conditional_t<is_recursive, std::atomic<std::uintptr_t>, Core*>;
+
+  [[nodiscard]] static auto pack(Core* core) noexcept {
+    if constexpr (is_recursive) {
+      const auto word = reinterpret_cast<std::uintptr_t>(core);
+      if ((word >> depth_shift) != 0) [[unlikely]] {
+        diagnostic("Error: lock at %p is too high in memory to hold a depth\n", static_cast<void*>(core));
+        _exit(1);
+      }
+      return word;
+    } else {
+      return core;
+    }
+  }
+
+  [[nodiscard, gnu::always_inline]] static Core* core_of(std::uintptr_t word) noexcept {
+    return reinterpret_cast<Core*>(static_cast<std::uintptr_t>(word & (one_level - 1)));
+  }
+
+  [[nodiscard, gnu::always_inline]] Core* core_ptr() const noexcept {
+    if constexpr (is_recursive) {
+      return core_of(m_core.load(std::memory_order_relaxed));
+    } else {
+      return m_core;
+    }
+  }
+
+  [[gnu::always_inline]] bool nest_write([[maybe_unused]] const ThreadState& self) noexcept {
+    if constexpr (is_recursive) {
+      const std::uintptr_t word = m_core.load(std::memory_order_relaxed);
+      if (core_of(word)->is_write_holder(self) && (word >> depth_shift) != max_write_nesting - 1) [[likely]] {
+        m_core.store(word + one_level, std::memory_order_relaxed);  // holding the lock is the first
+        return true;
+      }
+    }
+    return false;
+  }
+
+  [[noreturn, gnu::cold, gnu::noinline]] static void throw_refused(int status) {
 #if defined(__cpp_exceptions)
-    throw std::system_error(std::make_error_code(std::errc::resource_deadlock_would_occur));
+    throw std::system_error(std::make_error_code(static_cast<std::errc>(status)));
 #else
     // Built without exceptions, nothing can carry the error. As libstdc++ does here.
-    diagnostic("Fatal: thread already holds this latch::RwLock\n");
+    diagnostic("Fatal: latch::RwLock refused: %s\n",
+               status == EDEADLK ? "thread already holds this lock" : "too many nested locks");
     std::abort();
 #endif
   }
 
-  // Ticket queues cannot be abandoned, so timed acquisition polls the try path.
+  // now() + timeout overflows for a timeout such as hours::max(), which means to wait for
+  // good. Compared as floating point, where neither side overflows and rounding keeps the
+  // order, so the addition below is in range.
+  template <class Rep, class Period>
+  [[nodiscard]] static std::chrono::steady_clock::time_point deadline_after(
+      const std::chrono::duration<Rep, Period>& timeout) noexcept {
+    using Clock = std::chrono::steady_clock;
+    using Seconds = std::chrono::duration<double>;
+    const Clock::time_point now = Clock::now();
+    if (timeout <= std::chrono::duration<Rep, Period>::zero()) return now;
+    if (Seconds(timeout) >= Seconds(Clock::time_point::max() - now)) return Clock::time_point::max();
+    return now + std::chrono::ceil<Clock::duration>(timeout);
+  }
+
+  // A queue cannot be abandoned, so timed acquisition polls the try path.
+  // can_never_succeed: this thread's own hold is in the way, so waiting cannot help.
   template <class TimePoint>
-  static bool poll_until(const TimePoint& deadline, std::predicate auto attempt) noexcept {
+  static bool poll_until(const TimePoint& deadline, std::predicate auto attempt,
+                         std::predicate auto can_never_succeed) noexcept {
     for (long nap = 1'000;; nap = std::min(nap * 2, 1'000'000L)) {
       if (attempt()) return true;
-      if (TimePoint::clock::now() >= deadline) return false;
+      if (can_never_succeed() || TimePoint::clock::now() >= deadline) return false;
       short_sleep(nap);
     }
   }
 
-  RwLockCore* m_core;
+  Word m_core;
 };
 
 }  // namespace latch

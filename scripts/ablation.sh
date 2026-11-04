@@ -10,7 +10,7 @@ bench=$root/build/rw_bench
 args="ALength=64 NCSLength=50 WCSLength=4 RCSLength=10 _Duration=2000"
 declare -A variants=(
   [default]="" [no_bias]="-DLATCH_BIAS=0" [fenced_bias]="-DLATCH_ASYMMETRIC=0"
-  [no_parking]="-DLATCH_PARKING=0" [no_eager_reopen]="-DLATCH_EAGER_REOPEN=0"
+  [no_parking]="-DLATCH_PARKING=0"
   [flat_ticket]="-DLATCH_PROPORTIONAL_TICKET=0" [no_prefetchw]="-DLATCH_PREFETCHW=0"
   [split_indicator]="-DLATCH_SPLIT_INDICATOR=1" [no_pause_calibration]="-DLATCH_CALIBRATE_PAUSE=0"
   [fetch_tdma]="-DLATCH_FETCH_POLICY=1" [fetch_numa]="-DLATCH_FETCH_POLICY=2" [fetch_xadd]="-DLATCH_FETCH_POLICY=3"
@@ -23,6 +23,8 @@ for name in "${!variants[@]}"; do
 done
 run() {  # label preload env-assignment...
   local label=$1 lib=$2; shift 2
+  # A missing library is ignored by ld.so, which would record glibc under this label.
+  if [[ ! -f "$lib" ]]; then echo "skipping $label: no $lib" >&2; return; fi
   for load in "96 0" "96 1" "96 5" "96 50" "384 5" "384 50" "8 50" "1 100"; do
     set -- "$@"; read -r threads pct <<<"$load"
     for rep in 1 2; do

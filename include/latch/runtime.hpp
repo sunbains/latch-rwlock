@@ -3,6 +3,7 @@
 // constructor, before the C++ runtime or the application has initialized.
 #pragma once
 
+#include <sched.h>
 #include <linux/membarrier.h>
 #include <linux/mempolicy.h>
 #include <pthread.h>
@@ -34,9 +35,11 @@ class alignas(coherence_unit) Runtime {
   int m_cpu_capacity = 0;
   int m_node_count = 1;         // after folding, in [1, max_numa_nodes]
   int m_cpu_count = 1;
-  std::uint32_t m_grant_mask = 0;   // top-level grant slots - 1
-  std::uint32_t m_grant_shift = 0;  // log2 of the top-level grant slots
   int m_run_bound = 100;        // RunBound: fairness limit on local hand-off
+  std::uint32_t m_grant_mask = 0;   // FifoMutex: top-level grant slots - 1
+  std::uint32_t m_grant_shift = 0;  // FifoMutex: log2 of the top-level grant slots
+  std::uint32_t m_remote_poll_pauses = 0;  // BargingMutex: between looks at a lock owned elsewhere
+  std::uint32_t m_barge_limit = 256;       // BargingMutex, BargeLimit: acquisitions before a waiting node gets a turn
   int m_patience = 2000;        // Patience: nominal pauses before parking; <0 spins
   std::uint32_t m_admission_limit = 8;  // AdmissionLimit: queue depth per node; 0 disables
   int m_expected_writes = -1;    // ExpectedWrites: 0-100 fixes the profile; <0 is automatic
@@ -87,7 +90,9 @@ inline void pause_for(std::uint32_t nominal) noexcept { n_pause(scaled_pauses(no
 //  * type-stable memory, so an unlock may safely touch lock words after the store
 //    that releases the lock, even if another thread destroys the lock right then.
 
-enum class PoolKind { thread_state, read_memo, lock_core, node_state };
+// A pool's free list hands back any block, so each kind must have one size. The orders'
+// lock cores differ in size, so each has its own.
+enum class PoolKind { thread_state, read_memo, fifo_lock_core, barging_lock_core, node_state };
 
 // node < 0 means no placement preference.
 [[nodiscard]] inline void* pool_allocate(PoolKind kind, std::size_t size, int node = -1) noexcept;
@@ -120,7 +125,6 @@ class BiasTable {
   [[nodiscard]] std::size_t rows_in_use() const noexcept {
     return m_high_water.load(std::memory_order_relaxed) - m_free_count.load(std::memory_order_relaxed);
   }
-  void reset_after_fork(const BiasRow* keep) noexcept;
   void initialize() noexcept;
 
  private:
@@ -164,7 +168,6 @@ class alignas(coherence_unit) ThreadState {
   ReadMemo m_inline_memos[4];
 
   std::uint32_t m_type_tag = thread_type_tag;
-  std::uint32_t m_unique_id = 0;
   pid_t m_lwp_id = 0;
 
   // Find the memo for lock, or claim a free one. The list is short and thread-private, so a linear scan is the right structure.
@@ -177,11 +180,7 @@ class alignas(coherence_unit) ThreadState {
   }
 };
 
-#ifndef LATCH_TLS_MODEL
-#define LATCH_TLS_MODEL "initial-exec"  // define as "global-dynamic" for dlopen-heavy plugins
-#endif
-
-LATCH_SHARED_STATE [[gnu::tls_model(LATCH_TLS_MODEL)]] inline constinit thread_local ThreadState*
+LATCH_SHARED_STATE [[gnu::tls_model("initial-exec")]] inline constinit thread_local ThreadState*
     tls_thread_state = nullptr;
 
 [[gnu::cold]] inline ThreadState& register_current_thread() noexcept;
@@ -206,8 +205,17 @@ inline constexpr int runtime_ready = 2;
 
 LATCH_SHARED_STATE inline constinit std::atomic<int> runtime_state{runtime_uninitialized};
 LATCH_SHARED_STATE inline constinit pthread_key_t thread_key{};
-LATCH_SHARED_STATE inline constinit std::atomic<std::uint32_t> next_unique_id{1};
 LATCH_SHARED_STATE inline constinit const int* kernel_node_ids = nullptr;
+
+// CPUs this process may run on, which a cpuset or affinity mask can make far fewer
+// than the machine has. Decides when threads outnumber CPUs. Asks about the main thread,
+// not this one: the first thread to use a lock may be pinned, unlike the process.
+[[nodiscard]] inline int usable_cpu_count(int discovered) noexcept {
+  cpu_set_t allowed;
+  if (sched_getaffinity(getpid(), sizeof(allowed), &allowed) != 0) return discovered;
+  const int count = CPU_COUNT(&allowed);
+  return count > 0 ? std::min(count, discovered) : discovered;
+}
 
 [[nodiscard]] inline int eval_key(const char* name, int fallback) noexcept {
   const char* text = std::getenv(name);
@@ -220,6 +228,20 @@ LATCH_SHARED_STATE inline constinit const int* kernel_node_ids = nullptr;
 }
 
 // ---- Pools -------------------------------------------------------------------
+
+// Every region from mmap starts on a page, so without an offset the fields of different
+// structures share their low 12 address bits. A load then stalls on a recent store to the
+// same offset of another structure (4K aliasing). An uncontended read and unlock measured
+// 27 ns without this and 21 ns with it. Each region starts at its own offset within the page.
+LATCH_SHARED_STATE inline constinit std::atomic<std::uint32_t> next_region_colour{0};
+
+[[nodiscard]] inline std::size_t take_region_colour() noexcept {
+  constexpr std::size_t colour_range = 4096;
+  // The largest alignment of anything placed in a region, so that an offset keeps them all.
+  constexpr std::size_t step = std::max({coherence_unit, contended_unit, light_unit});
+  static_assert(step <= colour_range);
+  return (next_region_colour.fetch_add(1, std::memory_order_relaxed) * std::size_t{7} % (colour_range / step)) * step;
+}
 
 class BlockPool {
  public:
@@ -248,15 +270,15 @@ class BlockPool {
   [[nodiscard]] void* bump(std::size_t size, int node) noexcept {
     const std::size_t rounded = (size + coherence_unit - 1) & ~(coherence_unit - 1);
     if (static_cast<std::size_t>(m_end - m_cursor) < rounded) {
-      const std::size_t chunk = std::max<std::size_t>(1024 * 1024, rounded * 16);
+      const std::size_t chunk = std::max<std::size_t>(1024 * 1024, rounded * 16 + 4096);
       void* region = mmap(nullptr, chunk, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
       if (region == MAP_FAILED) {
         diagnostic("Error: mmap(%zu) failed\n", chunk);
         _exit(1);
       }
       if (node >= 0 && runtime.m_node_placement) place_on_node(region, chunk, node);
-      m_cursor = static_cast<char*>(region);
-      m_end = m_cursor + chunk;
+      m_cursor = static_cast<char*>(region) + take_region_colour();
+      m_end = static_cast<char*>(region) + chunk;
     }
     void* block = m_cursor;
     m_cursor += rounded;
@@ -279,17 +301,12 @@ class BlockPool {
   char* m_end = nullptr;
 };
 
-LATCH_SHARED_STATE inline constinit BlockPool shared_pools[3];
+LATCH_SHARED_STATE inline constinit BlockPool shared_pools[4];
 LATCH_SHARED_STATE inline constinit BlockPool node_pools[max_numa_nodes];
 
 [[nodiscard]] inline BlockPool& pool_for(PoolKind kind, int node) noexcept {
   if (kind == PoolKind::node_state) return node_pools[node < 0 ? 0 : node];
   return shared_pools[static_cast<int>(kind)];
-}
-
-inline void for_each_pool(auto&& visit) noexcept {
-  for (auto& pool : shared_pools) visit(pool);
-  for (auto& pool : node_pools) visit(pool);
 }
 
 // ---- Thread lifecycle --------------------------------------------------------
@@ -299,55 +316,19 @@ inline void reclaim_thread(ThreadState* thread) noexcept {
 
   ReadMemo* memo = thread->m_read_list;
   thread->m_read_list = nullptr;
-  bool holds_lock = false;
   while (memo != nullptr) {
     ReadMemo* const next = memo->m_next;
-    // Not strictly illegal, but diagnostic of an application error.
-    if (memo->m_lock != nullptr || memo->m_count != 0) {
-      holds_lock = true;
-      if (runtime.m_warn) {
-        diagnostic("Warning: thread %u exited while holding pthread_rwlock_t %p[%u]\n",
-                   thread->m_unique_id, memo->m_lock, memo->m_count);
-      }
-    }
     if (memo->m_from_pool) pool_release(PoolKind::read_memo, memo);
     memo = next;
   }
 
-  if (BiasRow* row = thread->m_bias_row) {
-    // A row with a live entry must stay visible to writers, as the permission it
-    // represents was never surrendered: retire it instead of recycling it.
-    for (auto& slot : row->m_slots) {
-      if (slot.load(std::memory_order_relaxed) != nullptr) holds_lock = true;
-    }
-    if (!holds_lock) bias_table.release_row(row);
-  }
+  if (BiasRow* row = thread->m_bias_row) bias_table.release_row(row);
   thread->m_type_tag = 0;
   pool_release(PoolKind::thread_state, thread);
 }
 
 inline void thread_exit_callback(void* value) noexcept {
   if (value != nullptr) reclaim_thread(static_cast<ThreadState*>(value));
-}
-
-// Spin locks are held across a fork() only if another thread was inside the
-// allocator, so take them all to give the child a consistent view.
-inline void fork_prepare() noexcept {
-  for_each_pool([](BlockPool& pool) { pool.m_lock.lock(); });
-}
-inline void fork_parent() noexcept {
-  for_each_pool([](BlockPool& pool) { pool.m_lock.unlock(); });
-}
-inline void fork_child() noexcept {
-  for_each_pool([](BlockPool& pool) { pool.m_lock.unlock(); });
-  // membarrier registration belongs to the address space, not inherited.
-  if (runtime.m_asymmetric) {
-    syscall(SYS_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0);
-  }
-  // The other threads do not exist here. Their published read slots would
-  // otherwise block writers in the child forever.
-  ThreadState* self = tls_thread_state;
-  bias_table.reset_after_fork(self != nullptr ? self->m_bias_row : nullptr);
 }
 
 [[nodiscard]] inline std::uint32_t measure_pause_q8() noexcept {
@@ -385,17 +366,19 @@ inline void initialize_runtime() noexcept {
   const int folded = restriction_mask == -1 ? std::min(topology.m_node_count, max_numa_nodes)
                                             : (restriction_mask & (max_numa_nodes - 1)) + 1;
   runtime.m_node_map = topology.m_node_map;
-  runtime.m_cpu_capacity = topology.m_cpu_capacity;
-  runtime.m_cpu_count = topology.m_cpu_count;
-  runtime.m_node_count = folded;
-  // One top-level waiter per node at most, so one slot per node gives each its own.
   const std::uint32_t grant_slots = std::bit_ceil(static_cast<std::uint32_t>(folded));
   runtime.m_grant_mask = grant_slots - 1;
   runtime.m_grant_shift = static_cast<std::uint32_t>(std::countr_zero(grant_slots));
+  runtime.m_cpu_capacity = topology.m_cpu_capacity;
+  runtime.m_cpu_count = usable_cpu_count(topology.m_cpu_count);
+  runtime.m_node_count = folded;
+  // One top-level waiter per node at most, so one slot per node gives each its own.
   kernel_node_ids = topology.m_physical_node;
   runtime.m_node_placement = eval_key("NodePlacement", 0) != 0 && folded > 1;
 
   runtime.m_pause_q8 = measure_pause_q8();
+  runtime.m_remote_poll_pauses = scaled_pauses(static_cast<std::uint32_t>(eval_key("RemotePoll", 1024)));
+  runtime.m_barge_limit = static_cast<std::uint32_t>(eval_key("BargeLimit", 256));
   runtime.m_patience_pauses =
       runtime.m_patience < 0 ? 0 : scaled_pauses(static_cast<std::uint32_t>(runtime.m_patience));
 
@@ -415,8 +398,6 @@ inline void initialize_runtime() noexcept {
     diagnostic("Error: pthread_key_create failed\n");
     _exit(1);
   }
-  pthread_atfork(fork_prepare, fork_parent, fork_child);
-
   if (runtime.m_verbose) {
     diagnostic("latch: nodes=%d pause_q8=%u patience=%u bias=%d asymmetric=%d placement=%d\n",
                runtime.m_node_count, runtime.m_pause_q8, runtime.m_patience_pauses, bias,
@@ -450,7 +431,8 @@ inline void pool_release(PoolKind kind, void* block, int node) noexcept {
 
 inline void BiasTable::initialize() noexcept {
   // Reserved lazily by the kernel: untouched rows consume no memory.
-  const std::size_t row_bytes = sizeof(BiasRow) * bias_row_capacity;
+  const std::size_t colour = detail::take_region_colour();
+  const std::size_t row_bytes = sizeof(BiasRow) * bias_row_capacity + colour;
   const std::size_t free_bytes = sizeof(std::uint32_t) * bias_row_capacity;
   void* rows = mmap(nullptr, row_bytes, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -460,7 +442,7 @@ inline void BiasTable::initialize() noexcept {
     diagnostic("Error: could not reserve the reader table\n");
     _exit(1);
   }
-  m_rows = static_cast<BiasRow*>(rows);
+  m_rows = reinterpret_cast<BiasRow*>(static_cast<char*>(rows) + colour);
   m_free_rows = static_cast<std::uint32_t*>(free_rows);
 }
 
@@ -486,14 +468,6 @@ inline void BiasTable::release_row(BiasRow* row) noexcept {
   m_free_rows[free_count] = static_cast<std::uint32_t>(row - m_rows);
   m_free_count.store(free_count + 1, std::memory_order_relaxed);
   m_lock.unlock();
-}
-
-inline void BiasTable::reset_after_fork(const BiasRow* keep) noexcept {
-  const std::size_t rows = m_high_water.load(std::memory_order_relaxed);
-  for (std::size_t index = 0; index < rows; ++index) {
-    if (&m_rows[index] == keep) continue;
-    for (auto& slot : m_rows[index].m_slots) slot.store(nullptr, std::memory_order_relaxed);
-  }
 }
 
 inline void heavy_fence() noexcept {
@@ -535,15 +509,13 @@ inline ReadMemo& ThreadState::memo_for(const void* lock) noexcept {
 inline ThreadState& register_current_thread() noexcept {
   ensure_runtime();
   auto* self = new (pool_allocate(PoolKind::thread_state, sizeof(ThreadState))) ThreadState{};
-  self->m_unique_id = detail::next_unique_id.fetch_add(1, std::memory_order_relaxed);
   self->m_lwp_id = static_cast<pid_t>(syscall(SYS_gettid));
   if (runtime.m_bias_enabled) self->m_bias_row = bias_table.acquire_row();
   // TLS first: pthread_setspecific may allocate, and that must not recurse here.
   tls_thread_state = self;
   pthread_setspecific(detail::thread_key, self);  // gives us the thread-exit callback
   if (runtime.m_verbose) {
-    diagnostic("Thread %d[%u] @ %p node=%d\n", self->m_lwp_id, self->m_unique_id,
-               static_cast<void*>(self), current_node());
+    diagnostic("Thread %d @ %p node=%d\n", self->m_lwp_id, static_cast<void*>(self), current_node());
   }
   return *self;
 }

@@ -6,7 +6,8 @@
 //   rw_bench [Key=Value ...] +<Threads>@<WritePct> [+<Threads>@<WritePct> ...]
 //
 // Lock=pthread (default) calls pthread_rwlock_*, so the same binary measures any
-// LD_PRELOAD implementation. Lock=native uses latch::RwLock directly.
+// LD_PRELOAD implementation. Lock=native uses latch::RwLock directly, Lock=recursive uses
+// latch::RecursiveRwLock, and Lock=barging uses latch::BargingRwLock.
 #include <alloca.h>
 #include <poll.h>
 #include <pthread.h>
@@ -111,6 +112,8 @@ struct ThreadBlock {
   }
 };
 
+enum class LockKind { pthread, native, recursive, barging };
+
 struct Options {
   int m_verbose = 0;
   int m_instances = 1;
@@ -121,14 +124,18 @@ struct Options {
   int m_barrier = 12;
   int m_bind = 0;
   const char* m_comment = "";
-  bool m_native = false;
+  LockKind m_kind = LockKind::pthread;
 };
 
 // Thread-to-CPU assignment for Bind=1: balance over nodes, then geographic order.
 [[nodiscard]] std::vector<int> build_placement() {
   const latch::Topology topology = latch::Topology::query(false);
   std::vector<std::vector<std::pair<int, int>>> by_node(static_cast<std::size_t>(topology.m_node_count));
-  for (int cpu = 0; cpu < topology.m_cpu_capacity - 1; ++cpu) {
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return {};
+  for (int cpu = 0; cpu < std::min(topology.m_cpu_capacity - 1, CPU_SETSIZE); ++cpu) {
+    if (!CPU_ISSET(cpu, &allowed)) continue;  // offline or outside this process's cpuset
     by_node[static_cast<std::size_t>(topology.m_node_map[cpu])].push_back({topology.m_geo_map[cpu], cpu});
   }
   std::vector<int> placement;
@@ -306,7 +313,7 @@ void RwBench<Lock>::worker(int id) {
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(m_placement[static_cast<std::size_t>(id) % m_placement.size()], &set);
-    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0) fail("could not bind thread", id);
   }
 
   RwNode<Lock>* const private_node = RwNode<Lock>::create(m_options.m_alength);
@@ -480,11 +487,18 @@ int RwBench<Lock>::run(const char* executable) {
   }
 
   latch::ensure_runtime();  // node map for per-node statistics
+  // A native lock never goes through pthread_rwlock_*, whatever is preloaded.
   const char* const preload = std::getenv("LD_PRELOAD");
-  const char* const lock_name = preload != nullptr ? preload : (m_options.m_native ? "<native>" : "<null>");
+  const char* const lock_name = m_options.m_kind == LockKind::recursive ? "<recursive>"
+                                : m_options.m_kind == LockKind::native  ? "<native>"
+                                : preload != nullptr                    ? preload
+                                                                        : "<null>";
   std::println("LD_PRELOAD={}", lock_name);
 
-  if (m_options.m_bind != 0) m_placement = build_placement();
+  if (m_options.m_bind != 0) {
+    m_placement = build_placement();
+    if (m_placement.empty()) fail("no CPUs to bind to", 0);
+  }
 
   if (m_options.m_vstress != 0) {
     std::println("Stress mode; concurrency changes every {} msecs. Ignore the performance results!", m_options.m_vstress);
@@ -633,7 +647,19 @@ int main(int argc, char* argv[]) {
     if (key == "Comment") {
       options.m_comment = value;
     } else if (key == "Lock") {
-      options.m_native = std::string_view(value) == "native";
+      const std::string_view kind = value;
+      if (kind == "pthread") {
+        options.m_kind = LockKind::pthread;
+      } else if (kind == "native") {
+        options.m_kind = LockKind::native;
+      } else if (kind == "recursive") {
+        options.m_kind = LockKind::recursive;
+      } else if (kind == "barging") {
+        options.m_kind = LockKind::barging;
+      } else {
+        std::println("Unknown lock : {}", kind);
+        return 1;
+      }
     } else {
       const auto* const binding = std::ranges::find(bindings, key, &Binding::m_key);
       if (binding == std::end(bindings)) {
@@ -648,7 +674,15 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  if (options.m_native) {
+  if (options.m_kind == LockKind::recursive) {
+    static RwBench<latch::RecursiveRwLock> bench(options, threads);
+    return bench.run(argv[0]);
+  }
+  if (options.m_kind == LockKind::barging) {
+    static RwBench<latch::BargingRwLock> bench(options, threads);
+    return bench.run(argv[0]);
+  }
+  if (options.m_kind == LockKind::native) {
     static RwBench<latch::RwLock> bench(options, threads);
     return bench.run(argv[0]);
   }

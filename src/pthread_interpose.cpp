@@ -5,6 +5,9 @@
 // caller's lock (zero under every initializer) hold a pointer to the real one,
 // installed on first use. Attributes are honored in the attribute object we own;
 // process-shared locks are refused at init rather than silently broken.
+//
+// There is no template parameter to pass through pthread_rwlock_t, so each order is its
+// own library: liblatch_interpose.so is FIFO, liblatch_interpose_barging.so is not.
 #include <errno.h>
 #include <pthread.h>
 #include <time.h>
@@ -12,10 +15,11 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 #include "latch/rw_lock.hpp"
 
-using latch::RwLockCore;
+using RwLockCore = latch::RwLockCore<latch::default_order>;
 using latch::ThreadState;
 
 namespace {
@@ -51,25 +55,29 @@ static_assert(sizeof(AttrOverlay) <= sizeof(pthread_rwlockattr_t));
   return inflate(lock);
 }
 
-[[nodiscard]] std::int64_t to_nanos(const timespec& time) noexcept {
-  return time.tv_sec * std::int64_t{1'000'000'000} + time.tv_nsec;
-}
-
-[[nodiscard]] std::int64_t now_nanos(clockid_t clock) noexcept {
+[[nodiscard]] timespec now_on(clockid_t clock) noexcept {
   timespec now{};
   clock_gettime(clock, &now);
-  return to_nanos(now);
+  return now;
 }
 
-// Ticket queues cannot be abandoned, so timed acquisition polls the try path.
+// Compared field by field: a deadline far in the future does not fit in nanoseconds.
+[[nodiscard]] bool has_passed(const timespec& deadline, const timespec& now) noexcept {
+  return now.tv_sec != deadline.tv_sec ? now.tv_sec > deadline.tv_sec : now.tv_nsec >= deadline.tv_nsec;
+}
+
+// Checked before anything else, even if the lock is free, as glibc does.
+[[nodiscard]] bool valid_deadline(clockid_t clock, const timespec* deadline) noexcept {
+  return (clock == CLOCK_REALTIME || clock == CLOCK_MONOTONIC) && deadline != nullptr && deadline->tv_nsec >= 0 &&
+         deadline->tv_nsec < 1'000'000'000;
+}
+
+// A queue cannot be abandoned, so timed acquisition polls the try path.
 int poll_deadline(auto attempt, clockid_t clock, const timespec* deadline) noexcept {
   int status = attempt();
   if (status != EBUSY) return status;
-  if (clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC) return EINVAL;
-  if (deadline == nullptr || deadline->tv_nsec < 0 || deadline->tv_nsec >= 1'000'000'000) return EINVAL;
-  const std::int64_t target = to_nanos(*deadline);
   for (long nap = 1'000;; nap = std::min(nap * 2, 1'000'000L)) {
-    if (now_nanos(clock) >= target) return ETIMEDOUT;
+    if (has_passed(*deadline, now_on(clock))) return ETIMEDOUT;
     latch::short_sleep(nap);
     status = attempt();
     if (status != EBUSY) return status;
@@ -77,6 +85,7 @@ int poll_deadline(auto attempt, clockid_t clock, const timespec* deadline) noexc
 }
 
 int timed_read(pthread_rwlock_t* lock, clockid_t clock, const timespec* deadline) noexcept {
+  if (!valid_deadline(clock, deadline)) return EINVAL;
   ThreadState& self = latch::current_thread();
   RwLockCore* const core = core_of(lock);
   if (core->is_write_holder(self)) return EDEADLK;
@@ -84,15 +93,26 @@ int timed_read(pthread_rwlock_t* lock, clockid_t clock, const timespec* deadline
 }
 
 int timed_write(pthread_rwlock_t* lock, clockid_t clock, const timespec* deadline) noexcept {
+  if (!valid_deadline(clock, deadline)) return EINVAL;
   ThreadState& self = latch::current_thread();
   RwLockCore* const core = core_of(lock);
   if (core->held_by(self)) return EDEADLK;
   return poll_deadline([&] { return core->try_write_acquire(self); }, clock, deadline);
 }
 
+// An invalid tv_nsec passes through, for valid_deadline to refuse.
 [[nodiscard]] timespec relative_deadline(const timespec& relative) noexcept {
-  const std::int64_t target = now_nanos(CLOCK_MONOTONIC) + to_nanos(relative);
-  return timespec{static_cast<time_t>(target / 1'000'000'000), static_cast<long>(target % 1'000'000'000)};
+  if (relative.tv_nsec < 0 || relative.tv_nsec >= 1'000'000'000) return relative;
+  const timespec now = now_on(CLOCK_MONOTONIC);
+  timespec deadline{};
+  deadline.tv_nsec = now.tv_nsec + relative.tv_nsec;
+  const bool carry = deadline.tv_nsec >= 1'000'000'000;
+  if (carry) deadline.tv_nsec -= 1'000'000'000;
+  if (__builtin_add_overflow(now.tv_sec, relative.tv_sec, &deadline.tv_sec) ||
+      __builtin_add_overflow(deadline.tv_sec, time_t{carry}, &deadline.tv_sec)) {
+    deadline.tv_sec = std::numeric_limits<time_t>::max();
+  }
+  return deadline;
 }
 
 }  // namespace
@@ -114,10 +134,7 @@ LATCH_EXPORT int pthread_rwlock_destroy(pthread_rwlock_t* lock) noexcept {
   const std::uintptr_t word = inflation_word(lock).load(std::memory_order_acquire);
   if (word == 0) return 0;
   auto* const core = reinterpret_cast<RwLockCore*>(word);
-  if (!core->is_quiescent()) {
-    if (latch::runtime.m_warn) latch::diagnostic("Error: destroying busy rwlock %p\n", static_cast<void*>(lock));
-    return EBUSY;
-  }
+  if (!core->is_quiescent()) return EBUSY;
   inflation_word(lock).store(0, std::memory_order_release);
   RwLockCore::dispose(core);
   return 0;
@@ -136,10 +153,7 @@ LATCH_EXPORT int pthread_rwlock_wrlock(pthread_rwlock_t* lock) noexcept {
 LATCH_EXPORT int pthread_rwlock_unlock(pthread_rwlock_t* lock) noexcept {
   ThreadState& self = latch::current_thread();
   const std::uintptr_t word = inflation_word(lock).load(std::memory_order_acquire);
-  if (word == 0) [[unlikely]] {
-    if (latch::runtime.m_warn) latch::diagnostic("Warning: unlocking idle rwlock %p\n", static_cast<void*>(lock));
-    return EPERM;
-  }
+  if (word == 0) [[unlikely]] return EPERM;
   return reinterpret_cast<RwLockCore*>(word)->release(self);
 }
 

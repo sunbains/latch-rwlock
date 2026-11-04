@@ -17,9 +17,6 @@
 #ifndef LATCH_PARKING
 #define LATCH_PARKING 1           // spin-then-futex waiting
 #endif
-#ifndef LATCH_EAGER_REOPEN
-#define LATCH_EAGER_REOPEN 0      // last writer reopens the reader fast path
-#endif
 #ifndef LATCH_PROPORTIONAL_TICKET
 #define LATCH_PROPORTIONAL_TICKET 0  // node ticket wait scales with queue distance
 #endif
@@ -56,7 +53,6 @@ enum class FetchIncrementPolicy { backoff, tdma, numa, xadd };
 inline constexpr bool bias_compiled = LATCH_BIAS != 0;
 inline constexpr bool asymmetric_compiled = LATCH_ASYMMETRIC != 0;
 inline constexpr bool parking_compiled = LATCH_PARKING != 0;
-inline constexpr bool eager_reopen_compiled = LATCH_EAGER_REOPEN != 0;
 inline constexpr bool proportional_ticket_compiled = LATCH_PROPORTIONAL_TICKET != 0;
 inline constexpr bool prefetchw_compiled = LATCH_PREFETCHW != 0;
 inline constexpr bool split_indicator_compiled = LATCH_SPLIT_INDICATOR != 0;
