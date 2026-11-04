@@ -199,7 +199,9 @@ class Mutex {
     GrantLine& line = grant(successor);
     // Node lock first. Once the top lock goes, another node's thread can take it, release
     // it and destroy the lock, and a new lock can be given this NodeState: a late store of
-    // a grant would corrupt that lock. Late reads are safe, as the memory is type-stable.
+    // a grant would corrupt that lock. What remains late is safe, as the memory is
+    // type-stable: reads, and in admit_next a gate wake-up, which at worst admits one
+    // extra thread to the new lock's queue.
     local.m_grant.store(next, std::memory_order_release);
     line.m_grant.store(successor, std::memory_order_release);
     if constexpr (parking_compiled) {

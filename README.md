@@ -22,9 +22,8 @@ holding the write lock, or `lock()` by a thread holding a read lock, throws
 `std::system_error` with `std::errc::resource_deadlock_would_occur`. Nothing is acquired
 and what the thread held is unchanged, so this is safe through `std::unique_lock`,
 `std::shared_lock` and `std::lock_guard`. The `try_` forms return `false` instead, and the
-timed forms do so at once, as waiting cannot help. Nesting past 2^32 levels throws
-`std::errc::resource_unavailable_try_again`. Code built with `-fno-exceptions` has no way
-to carry these errors, so there the same calls abort.
+timed forms do so at once, as waiting cannot help. Code built with `-fno-exceptions` has
+no way to carry these errors, so there the same calls abort.
 
 For a write lock that a thread can take again, use `latch::RecursiveRwLock`, which is
 `latch::BasicRwLock<latch::Recursion::write>`:
@@ -37,12 +36,11 @@ void outer() { std::unique_lock guard(lock); inner(); }
 ```
 
 Each `lock()` needs its own `unlock()`, and the lock stays exclusive until the last one.
-An `unlock()` from a thread that does not hold it is ignored with a warning while the lock
-is nested. Mixing read and write locks still throws. Do not wait on a
+Nesting past `latch::max_write_nesting` levels (1024) throws
+`std::errc::resource_unavailable_try_again`. Mixing read and write locks still throws. Do not wait on a
 `std::condition_variable_any` while nested, as it releases only one level. `RwLock` does
-not contain the depth counter or its checks: it is 8 bytes, against 16 here.
-
-A thread that exits holding the write lock leaves it locked for good, as with any mutex.
+not contain the depth or its checks. Both are 8 bytes, as the depth uses spare bits of the
+pointer.
 
 By default a lock adjusts itself to the mix of reads and writes it observes. To fix its
 behavior instead, give the expected share of writes as a percentage:
@@ -112,8 +110,8 @@ LD_PRELOAD=build/liblatch_interpose.so ./your-program
 ```
 
 These locks are never recursive. A nested write returns `EDEADLK`, as does a read under a
-write or a write under a read, and nesting past 2^32 read levels returns `EAGAIN`. The timed
-forms check their arguments first, even if the lock is free, as glibc does.
+write or a write under a read. The timed forms check their arguments first, even if the
+lock is free, as glibc does.
 
 Process-shared locks are not supported, and `pthread_rwlock_init` returns `ENOTSUP` for
 them. A process-shared lock placed in shared memory without an attribute-carrying init
