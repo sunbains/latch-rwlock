@@ -594,6 +594,9 @@ class alignas(coherence_unit) RwLockCore {
       clear = bias_table.row(index).m_slots[m_bias_column].load(std::memory_order_acquire) != this;
     }
     inhibit_bias(began);
+    // A reader is still in its slot, so writers must keep scanning for it. Writers decide
+    // whether to scan from the bias, and we still hold the write mutex.
+    if (!clear) m_bias.store(1, std::memory_order_relaxed);
     return clear;
   }
 

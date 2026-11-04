@@ -194,6 +194,69 @@ void test_native() {
     test_self_deadlock(no_fast_reads);
   }
 
+  std::println("native: a failed try_lock must not lose sight of a fast-path reader");
+  {
+    latch::RwLock lock;
+    lock.lock_shared();  // the first, slow reader enables the bias
+    lock.unlock_shared();
+    std::atomic<bool> holding{false};
+    std::atomic<bool> finish{false};
+    std::thread reader([&] {
+      lock.lock_shared();
+      holding.store(true);
+      while (!finish.load()) std::this_thread::sleep_for(1ms);
+      lock.unlock_shared();
+    });
+    while (!holding.load()) std::this_thread::yield();
+    CHECK(!lock.try_lock());
+    CHECK(!lock.try_lock());
+    CHECK(!lock.try_lock_for(5ms));
+    std::atomic<bool> entered{false};
+    std::thread writer([&] {
+      lock.lock();
+      entered.store(true);
+      lock.unlock();
+    });
+    std::this_thread::sleep_for(50ms);
+    CHECK(!entered.load());
+    finish.store(true);
+    reader.join();
+    writer.join();
+    CHECK(entered.load());
+  }
+
+  std::println("native: try_lock writers exclude fast-path readers");
+  {
+    latch::RwLock lock;
+    std::atomic<int> readers_inside{0};
+    std::atomic<int> writers_inside{0};
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> threads;
+    for (unsigned index = 0; index < 6; ++index) {
+      threads.emplace_back([&, index] {
+        while (!stop.load(std::memory_order_relaxed)) {
+          if (index % 3 == 0) {
+            if (lock.try_lock()) {
+              CHECK(writers_inside.fetch_add(1) == 0);
+              CHECK(readers_inside.load() == 0);
+              writers_inside.fetch_sub(1);
+              lock.unlock();
+            }
+          } else {
+            lock.lock_shared();
+            readers_inside.fetch_add(1);
+            CHECK(writers_inside.load() == 0);
+            readers_inside.fetch_sub(1);
+            lock.unlock_shared();
+          }
+        }
+      });
+    }
+    std::this_thread::sleep_for(500ms);
+    stop.store(true);
+    for (auto& thread : threads) thread.join();
+  }
+
   std::println("native: guards");
   {
     latch::RwLock lock;
@@ -575,6 +638,28 @@ void test_pthread() {
     waitpid(child, &status, 0);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     hold.store(false);
+    reader.join();
+  }
+
+  std::println("pthread: a failed trywrlock must not lose sight of a fast-path reader");
+  {
+    PosixLock posix;
+    CHECK(pthread_rwlock_rdlock(&posix.m_lock) == 0);  // the first, slow reader enables the bias
+    CHECK(pthread_rwlock_unlock(&posix.m_lock) == 0);
+    std::atomic<bool> holding{false};
+    std::atomic<bool> finish{false};
+    std::thread reader([&] {
+      CHECK(pthread_rwlock_rdlock(&posix.m_lock) == 0);
+      holding.store(true);
+      while (!finish.load()) std::this_thread::sleep_for(1ms);
+      CHECK(pthread_rwlock_unlock(&posix.m_lock) == 0);
+    });
+    while (!holding.load()) std::this_thread::yield();
+    CHECK(pthread_rwlock_trywrlock(&posix.m_lock) == EBUSY);
+    CHECK(pthread_rwlock_trywrlock(&posix.m_lock) == EBUSY);
+    timespec deadline = deadline_in(CLOCK_REALTIME, 5);
+    CHECK(pthread_rwlock_timedwrlock(&posix.m_lock, &deadline) == ETIMEDOUT);
+    finish.store(true);
     reader.join();
   }
 
