@@ -89,7 +89,11 @@ enum class LockMode : std::uint32_t {
   writer_resolving = 2,  // stays set across a stream of writers: they skip the drain
 };
 
+template <Order order>
 class alignas(coherence_unit) RwLockCore {
+  using Mutex = MutexFor<order>;
+  static constexpr PoolKind pool_kind = order == Order::fifo ? PoolKind::fifo_lock_core : PoolKind::barging_lock_core;
+
  public:
   RwLockCore() noexcept {
     if (runtime.m_expected_writes >= 0) {
@@ -101,6 +105,7 @@ class alignas(coherence_unit) RwLockCore {
     for (int node = 0; node < runtime.m_node_count; ++node) {
       m_nodes[node] = new (pool_allocate(PoolKind::node_state, sizeof(NodeState), node)) NodeState{};
       m_nodes[node]->m_ticket.m_local_limit = runtime.m_run_bound;
+      m_nodes[node]->m_ticket.m_node_index = static_cast<std::uint32_t>(node);
     }
     constinit static std::atomic<std::uint32_t> next_column{0};
     m_bias_column = next_column.fetch_add(1, std::memory_order_relaxed) % bias_columns;
@@ -124,11 +129,11 @@ class alignas(coherence_unit) RwLockCore {
 
   [[nodiscard]] static RwLockCore* create() noexcept {
     ensure_runtime();
-    return new (pool_allocate(PoolKind::lock_core, allocation_size())) RwLockCore{};
+    return new (pool_allocate(pool_kind, allocation_size())) RwLockCore{};
   }
   [[nodiscard]] static RwLockCore* create(ExpectedWrites expected) noexcept {
     ensure_runtime();
-    return new (pool_allocate(PoolKind::lock_core, allocation_size())) RwLockCore{expected};
+    return new (pool_allocate(pool_kind, allocation_size())) RwLockCore{expected};
   }
 
   // Total memory of one lock, including its per-node state.
@@ -143,7 +148,7 @@ class alignas(coherence_unit) RwLockCore {
   [[nodiscard]] bool is_adaptive() const noexcept { return m_adaptive; }
   static void dispose(RwLockCore* core) noexcept {
     core->~RwLockCore();
-    pool_release(PoolKind::lock_core, core);
+    pool_release(pool_kind, core);
   }
 
   // Returns 0 or EDEADLK.
@@ -376,6 +381,8 @@ class alignas(coherence_unit) RwLockCore {
       // count but not yet slept: its futex_wait then fails on the changed flag.
       // Seq-cst: this load must not pass the increment above, or the writer can miss the
       // departure while this misses the flag, and the writer sleeps with no timeout.
+      // The increment can already have let the lock be destroyed and its memory reused, so
+      // this can clear a new lock's flag. That writer wakes early, rechecks and sleeps again.
       if (m_drain_parked.load(std::memory_order_seq_cst) != 0 &&
           m_drain_parked.exchange(0, std::memory_order_seq_cst) != 0) [[unlikely]] {
         futex_wake_all(m_drain_parked);
@@ -394,6 +401,15 @@ class alignas(coherence_unit) RwLockCore {
 
     ReaderIndicator& readers = m_nodes[memo.m_node]->m_readers;
     for (;;) {
+      // The mode may just be left over from a finished writer. A reader alone can then open
+      // the lock itself, which takes far fewer atomics than forming a group of one.
+      if (m_mode.load(std::memory_order_relaxed) != LockMode::reading &&
+          m_read_arrive.load(std::memory_order_relaxed) == 0 && m_write_mutex.try_lock(local_ticket())) {
+        m_mode.store(LockMode::reading, std::memory_order_release);
+        fetch_increment(readers.m_ingress);
+        m_write_mutex.unlock();
+        break;
+      }
       fetch_increment(readers.m_ingress);
       if (m_mode.load(std::memory_order_seq_cst) == LockMode::reading) break;
 
@@ -487,13 +503,6 @@ class alignas(coherence_unit) RwLockCore {
 
   void write_release() noexcept {
     m_writer_active.store(nullptr, std::memory_order_relaxed);
-    if constexpr (eager_reopen_compiled) {
-      // Nobody queued: leaving the mode set would send the next reader through the
-      // write mutex. A writer arriving just after this pays only a drain.
-      if (!m_write_mutex.has_waiters()) {
-        m_mode.store(LockMode::reading, std::memory_order_release);
-      }
-    }
     m_write_mutex.unlock();
   }
 
@@ -620,21 +629,23 @@ class alignas(coherence_unit) RwLockCore {
   alignas(light_unit) std::atomic<std::uint32_t> m_read_depart{0};
   std::atomic<std::uint32_t> m_depart_parked{0};
 
-  // Must stay last: its grant slots follow it in memory.
+  // Must stay last: FifoMutex's grant slots follow it in memory.
   Mutex m_write_mutex;
 };
 
 // Native interface. Meets the SharedTimedMutex requirements, so std::unique_lock
 // and std::shared_lock work. The object is one word; the state it refers to is
 // type-stable, which makes destroying the lock right after an unlock safe.
-template <Recursion recursion>
+template <Recursion recursion, Order order>
 class BasicRwLock {
+  using Core = RwLockCore<order>;
+
  public:
   // Adjusts itself to the observed mix of reads and writes.
-  BasicRwLock() noexcept : m_core(pack(RwLockCore::create())) {}
+  BasicRwLock() noexcept : m_core(pack(Core::create())) {}
   // Fixed configuration, no adjustment: RwLock lock{ExpectedWrites{50}};
-  explicit BasicRwLock(ExpectedWrites expected) noexcept : m_core(pack(RwLockCore::create(expected))) {}
-  ~BasicRwLock() { RwLockCore::dispose(core_ptr()); }
+  explicit BasicRwLock(ExpectedWrites expected) noexcept : m_core(pack(Core::create(expected))) {}
+  ~BasicRwLock() { Core::dispose(core_ptr()); }
   BasicRwLock(const BasicRwLock&) = LATCH_DELETE("a lock has identity");
   BasicRwLock& operator=(const BasicRwLock&) = LATCH_DELETE("a lock has identity");
 
@@ -693,7 +704,7 @@ class BasicRwLock {
     return try_lock_shared_until(deadline_after(timeout));
   }
 
-  [[nodiscard]] RwLockCore& core() noexcept { return *core_ptr(); }
+  [[nodiscard]] Core& core() noexcept { return *core_ptr(); }
 
  private:
   static constexpr bool is_recursive = recursion == Recursion::write;
@@ -707,9 +718,9 @@ class BasicRwLock {
   static constexpr std::uint64_t one_level = std::uint64_t{1} << depth_shift;
   static_assert(max_write_nesting - 1 < (std::uint64_t{1} << (64 - depth_shift)));
 
-  using Word = std::conditional_t<is_recursive, std::atomic<std::uintptr_t>, RwLockCore*>;
+  using Word = std::conditional_t<is_recursive, std::atomic<std::uintptr_t>, Core*>;
 
-  [[nodiscard]] static auto pack(RwLockCore* core) noexcept {
+  [[nodiscard]] static auto pack(Core* core) noexcept {
     if constexpr (is_recursive) {
       const auto word = reinterpret_cast<std::uintptr_t>(core);
       if ((word >> depth_shift) != 0) [[unlikely]] {
@@ -722,11 +733,11 @@ class BasicRwLock {
     }
   }
 
-  [[nodiscard, gnu::always_inline]] static RwLockCore* core_of(std::uintptr_t word) noexcept {
-    return reinterpret_cast<RwLockCore*>(static_cast<std::uintptr_t>(word & (one_level - 1)));
+  [[nodiscard, gnu::always_inline]] static Core* core_of(std::uintptr_t word) noexcept {
+    return reinterpret_cast<Core*>(static_cast<std::uintptr_t>(word & (one_level - 1)));
   }
 
-  [[nodiscard, gnu::always_inline]] RwLockCore* core_ptr() const noexcept {
+  [[nodiscard, gnu::always_inline]] Core* core_ptr() const noexcept {
     if constexpr (is_recursive) {
       return core_of(m_core.load(std::memory_order_relaxed));
     } else {
@@ -770,7 +781,7 @@ class BasicRwLock {
     return now + std::chrono::ceil<Clock::duration>(timeout);
   }
 
-  // Ticket queues cannot be abandoned, so timed acquisition polls the try path.
+  // A queue cannot be abandoned, so timed acquisition polls the try path.
   // can_never_succeed: this thread's own hold is in the way, so waiting cannot help.
   template <class TimePoint>
   static bool poll_until(const TimePoint& deadline, std::predicate auto attempt,

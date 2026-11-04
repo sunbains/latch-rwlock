@@ -42,41 +42,64 @@ set_target_properties(latch_rwlock PROPERTIES EXPORT_NAME rwlock)
 
 set(latch_warnings -Wall -Wextra -Wno-unused-parameter)
 
+# Intel's JCC erratum makes a loop's speed depend on where its branches fall: the same read path
+# measured 180M or 243M ops/s depending only on unrelated code. Without this, comparisons between
+# builds measure the alignment of the code and not the lock.
+set(latch_stable_alignment "")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+  set(latch_stable_alignment -Wa,-mbranches-within-32B-boundaries)
+endif()
+
 if(LATCH_BUILD_BENCH)
   add_executable(rw_bench bench/rw_bench.cpp)
   target_link_libraries(rw_bench PRIVATE latch::rwlock)
-  target_compile_options(rw_bench PRIVATE ${latch_warnings} -O3 -g)
+  target_compile_options(rw_bench PRIVATE ${latch_warnings} -O3 -g ${latch_stable_alignment})
 endif()
 
 if(LATCH_BUILD_INTERPOSER)
-  # Must not depend on libstdc++: it loads into arbitrary binaries.
-  add_library(latch_interpose SHARED src/pthread_interpose.cpp)
-  target_link_libraries(latch_interpose PRIVATE latch::rwlock)
-  target_compile_options(latch_interpose PRIVATE ${latch_warnings} -O3 -g
-    -fno-exceptions -fno-rtti -fno-threadsafe-statics -fno-strict-aliasing
-    -fno-semantic-interposition -fno-plt $<$<CXX_COMPILER_ID:GNU>:-Wno-missing-attributes>)
-  target_link_options(latch_interpose PRIVATE
-    -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/latch.map -nodefaultlibs)
-  target_link_libraries(latch_interpose PRIVATE c gcc_s gcc)
-  set_target_properties(latch_interpose PROPERTIES
-    CXX_VISIBILITY_PRESET hidden
-    LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/latch.map)
+  function(latch_add_interposer name order)
+    # Must not depend on libstdc++: it loads into arbitrary binaries.
+    add_library(${name} SHARED src/pthread_interpose.cpp)
+    target_compile_definitions(${name} PRIVATE LATCH_DEFAULT_ORDER=${order})
+    target_link_libraries(${name} PRIVATE latch::rwlock)
+    target_compile_options(${name} PRIVATE ${latch_warnings} -O3 -g ${latch_stable_alignment}
+      -fno-exceptions -fno-rtti -fno-threadsafe-statics -fno-strict-aliasing
+      -fno-semantic-interposition -fno-plt $<$<CXX_COMPILER_ID:GNU>:-Wno-missing-attributes>)
+    target_link_options(${name} PRIVATE
+      -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/latch.map -nodefaultlibs)
+    target_link_libraries(${name} PRIVATE c gcc_s gcc)
+    set_target_properties(${name} PROPERTIES
+      CXX_VISIBILITY_PRESET hidden
+      LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/latch.map)
+  endfunction()
+  latch_add_interposer(latch_interpose fifo)
+  latch_add_interposer(latch_interpose_barging barging)
 endif()
 
 if(LATCH_BUILD_TESTS)
   enable_testing()
-  add_executable(test_rwlock tests/test_rwlock.cpp)
-  target_link_libraries(test_rwlock PRIVATE latch::rwlock)
-  target_compile_options(test_rwlock PRIVATE ${latch_warnings})
-  if(LATCH_TSAN)
-    target_compile_options(test_rwlock PRIVATE -fsanitize=thread -O1 -g)
-    target_link_options(test_rwlock PRIVATE -fsanitize=thread)
-  endif()
+  # The same tests under each order, as RwLock follows the default.
+  function(latch_add_test_binary name order)
+    add_executable(${name} tests/test_rwlock.cpp)
+    target_compile_definitions(${name} PRIVATE LATCH_DEFAULT_ORDER=${order})
+    target_link_libraries(${name} PRIVATE latch::rwlock)
+    target_compile_options(${name} PRIVATE ${latch_warnings})
+    if(LATCH_TSAN)
+      target_compile_options(${name} PRIVATE -fsanitize=thread -O1 -g)
+      target_link_options(${name} PRIVATE -fsanitize=thread)
+    endif()
+  endfunction()
+  latch_add_test_binary(test_rwlock fifo)
+  latch_add_test_binary(test_rwlock_barging barging)
   add_test(NAME native COMMAND test_rwlock native)
+  add_test(NAME native_barging COMMAND test_rwlock_barging native)
   if(LATCH_BUILD_INTERPOSER AND NOT LATCH_TSAN)
     add_test(NAME pthread COMMAND test_rwlock pthread)
     set_tests_properties(pthread PROPERTIES
       ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:latch_interpose>")
+    add_test(NAME pthread_barging COMMAND test_rwlock_barging pthread)
+    set_tests_properties(pthread_barging PROPERTIES
+      ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:latch_interpose_barging>")
   endif()
 endif()
 

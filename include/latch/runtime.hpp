@@ -35,9 +35,11 @@ class alignas(coherence_unit) Runtime {
   int m_cpu_capacity = 0;
   int m_node_count = 1;         // after folding, in [1, max_numa_nodes]
   int m_cpu_count = 1;
-  std::uint32_t m_grant_mask = 0;   // top-level grant slots - 1
-  std::uint32_t m_grant_shift = 0;  // log2 of the top-level grant slots
   int m_run_bound = 100;        // RunBound: fairness limit on local hand-off
+  std::uint32_t m_grant_mask = 0;   // FifoMutex: top-level grant slots - 1
+  std::uint32_t m_grant_shift = 0;  // FifoMutex: log2 of the top-level grant slots
+  std::uint32_t m_remote_poll_pauses = 0;  // BargingMutex: between looks at a lock owned elsewhere
+  std::uint32_t m_barge_limit = 256;       // BargingMutex, BargeLimit: acquisitions before a waiting node gets a turn
   int m_patience = 2000;        // Patience: nominal pauses before parking; <0 spins
   std::uint32_t m_admission_limit = 8;  // AdmissionLimit: queue depth per node; 0 disables
   int m_expected_writes = -1;    // ExpectedWrites: 0-100 fixes the profile; <0 is automatic
@@ -88,7 +90,9 @@ inline void pause_for(std::uint32_t nominal) noexcept { n_pause(scaled_pauses(no
 //  * type-stable memory, so an unlock may safely touch lock words after the store
 //    that releases the lock, even if another thread destroys the lock right then.
 
-enum class PoolKind { thread_state, read_memo, lock_core, node_state };
+// A pool's free list hands back any block, so each kind must have one size. The orders'
+// lock cores differ in size, so each has its own.
+enum class PoolKind { thread_state, read_memo, fifo_lock_core, barging_lock_core, node_state };
 
 // node < 0 means no placement preference.
 [[nodiscard]] inline void* pool_allocate(PoolKind kind, std::size_t size, int node = -1) noexcept;
@@ -225,6 +229,20 @@ LATCH_SHARED_STATE inline constinit const int* kernel_node_ids = nullptr;
 
 // ---- Pools -------------------------------------------------------------------
 
+// Every region from mmap starts on a page, so without an offset the fields of different
+// structures share their low 12 address bits. A load then stalls on a recent store to the
+// same offset of another structure (4K aliasing). An uncontended read and unlock measured
+// 27 ns without this and 21 ns with it. Each region starts at its own offset within the page.
+LATCH_SHARED_STATE inline constinit std::atomic<std::uint32_t> next_region_colour{0};
+
+[[nodiscard]] inline std::size_t take_region_colour() noexcept {
+  constexpr std::size_t colour_range = 4096;
+  // The largest alignment of anything placed in a region, so that an offset keeps them all.
+  constexpr std::size_t step = std::max({coherence_unit, contended_unit, light_unit});
+  static_assert(step <= colour_range);
+  return (next_region_colour.fetch_add(1, std::memory_order_relaxed) * std::size_t{7} % (colour_range / step)) * step;
+}
+
 class BlockPool {
  public:
   [[nodiscard]] void* allocate(std::size_t size, int node) noexcept {
@@ -252,15 +270,15 @@ class BlockPool {
   [[nodiscard]] void* bump(std::size_t size, int node) noexcept {
     const std::size_t rounded = (size + coherence_unit - 1) & ~(coherence_unit - 1);
     if (static_cast<std::size_t>(m_end - m_cursor) < rounded) {
-      const std::size_t chunk = std::max<std::size_t>(1024 * 1024, rounded * 16);
+      const std::size_t chunk = std::max<std::size_t>(1024 * 1024, rounded * 16 + 4096);
       void* region = mmap(nullptr, chunk, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
       if (region == MAP_FAILED) {
         diagnostic("Error: mmap(%zu) failed\n", chunk);
         _exit(1);
       }
       if (node >= 0 && runtime.m_node_placement) place_on_node(region, chunk, node);
-      m_cursor = static_cast<char*>(region);
-      m_end = m_cursor + chunk;
+      m_cursor = static_cast<char*>(region) + take_region_colour();
+      m_end = static_cast<char*>(region) + chunk;
     }
     void* block = m_cursor;
     m_cursor += rounded;
@@ -283,7 +301,7 @@ class BlockPool {
   char* m_end = nullptr;
 };
 
-LATCH_SHARED_STATE inline constinit BlockPool shared_pools[3];
+LATCH_SHARED_STATE inline constinit BlockPool shared_pools[4];
 LATCH_SHARED_STATE inline constinit BlockPool node_pools[max_numa_nodes];
 
 [[nodiscard]] inline BlockPool& pool_for(PoolKind kind, int node) noexcept {
@@ -348,17 +366,19 @@ inline void initialize_runtime() noexcept {
   const int folded = restriction_mask == -1 ? std::min(topology.m_node_count, max_numa_nodes)
                                             : (restriction_mask & (max_numa_nodes - 1)) + 1;
   runtime.m_node_map = topology.m_node_map;
+  const std::uint32_t grant_slots = std::bit_ceil(static_cast<std::uint32_t>(folded));
+  runtime.m_grant_mask = grant_slots - 1;
+  runtime.m_grant_shift = static_cast<std::uint32_t>(std::countr_zero(grant_slots));
   runtime.m_cpu_capacity = topology.m_cpu_capacity;
   runtime.m_cpu_count = usable_cpu_count(topology.m_cpu_count);
   runtime.m_node_count = folded;
   // One top-level waiter per node at most, so one slot per node gives each its own.
-  const std::uint32_t grant_slots = std::bit_ceil(static_cast<std::uint32_t>(folded));
-  runtime.m_grant_mask = grant_slots - 1;
-  runtime.m_grant_shift = static_cast<std::uint32_t>(std::countr_zero(grant_slots));
   kernel_node_ids = topology.m_physical_node;
   runtime.m_node_placement = eval_key("NodePlacement", 0) != 0 && folded > 1;
 
   runtime.m_pause_q8 = measure_pause_q8();
+  runtime.m_remote_poll_pauses = scaled_pauses(static_cast<std::uint32_t>(eval_key("RemotePoll", 1024)));
+  runtime.m_barge_limit = static_cast<std::uint32_t>(eval_key("BargeLimit", 256));
   runtime.m_patience_pauses =
       runtime.m_patience < 0 ? 0 : scaled_pauses(static_cast<std::uint32_t>(runtime.m_patience));
 
@@ -411,7 +431,8 @@ inline void pool_release(PoolKind kind, void* block, int node) noexcept {
 
 inline void BiasTable::initialize() noexcept {
   // Reserved lazily by the kernel: untouched rows consume no memory.
-  const std::size_t row_bytes = sizeof(BiasRow) * bias_row_capacity;
+  const std::size_t colour = detail::take_region_colour();
+  const std::size_t row_bytes = sizeof(BiasRow) * bias_row_capacity + colour;
   const std::size_t free_bytes = sizeof(std::uint32_t) * bias_row_capacity;
   void* rows = mmap(nullptr, row_bytes, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -421,7 +442,7 @@ inline void BiasTable::initialize() noexcept {
     diagnostic("Error: could not reserve the reader table\n");
     _exit(1);
   }
-  m_rows = static_cast<BiasRow*>(rows);
+  m_rows = reinterpret_cast<BiasRow*>(static_cast<char*>(rows) + colour);
   m_free_rows = static_cast<std::uint32_t*>(free_rows);
 }
 

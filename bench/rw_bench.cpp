@@ -6,8 +6,8 @@
 //   rw_bench [Key=Value ...] +<Threads>@<WritePct> [+<Threads>@<WritePct> ...]
 //
 // Lock=pthread (default) calls pthread_rwlock_*, so the same binary measures any
-// LD_PRELOAD implementation. Lock=native uses latch::RwLock directly, and
-// Lock=recursive uses latch::RecursiveRwLock.
+// LD_PRELOAD implementation. Lock=native uses latch::RwLock directly, Lock=recursive uses
+// latch::RecursiveRwLock, and Lock=barging uses latch::BargingRwLock.
 #include <alloca.h>
 #include <poll.h>
 #include <pthread.h>
@@ -112,7 +112,7 @@ struct ThreadBlock {
   }
 };
 
-enum class LockKind { pthread, native, recursive };
+enum class LockKind { pthread, native, recursive, barging };
 
 struct Options {
   int m_verbose = 0;
@@ -654,6 +654,8 @@ int main(int argc, char* argv[]) {
         options.m_kind = LockKind::native;
       } else if (kind == "recursive") {
         options.m_kind = LockKind::recursive;
+      } else if (kind == "barging") {
+        options.m_kind = LockKind::barging;
       } else {
         std::println("Unknown lock : {}", kind);
         return 1;
@@ -674,6 +676,10 @@ int main(int argc, char* argv[]) {
 
   if (options.m_kind == LockKind::recursive) {
     static RwBench<latch::RecursiveRwLock> bench(options, threads);
+    return bench.run(argv[0]);
+  }
+  if (options.m_kind == LockKind::barging) {
+    static RwBench<latch::BargingRwLock> bench(options, threads);
     return bench.run(argv[0]);
   }
   if (options.m_kind == LockKind::native) {

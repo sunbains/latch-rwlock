@@ -27,7 +27,12 @@
 #include "latch/latch.hpp"
 
 // Compiles every member, and shows that the depth takes no extra space.
-template class latch::BasicRwLock<latch::Recursion::write>;
+template class latch::BasicRwLock<latch::Recursion::none, latch::Order::fifo>;
+template class latch::BasicRwLock<latch::Recursion::write, latch::Order::fifo>;
+template class latch::BasicRwLock<latch::Recursion::none, latch::Order::barging>;
+template class latch::BasicRwLock<latch::Recursion::write, latch::Order::barging>;
+static_assert(sizeof(latch::BargingRwLock) == sizeof(void*));
+static_assert(sizeof(latch::RecursiveBargingRwLock) == sizeof(void*));
 static_assert(sizeof(latch::RwLock) == sizeof(void*));
 static_assert(sizeof(latch::RecursiveRwLock) == sizeof(void*));
 
@@ -134,6 +139,89 @@ bool refused_as_deadlock(auto attempt) {
     return error.code() == std::errc::resource_deadlock_would_occur;
   }
   return false;
+}
+
+// Hammering writers, pinned across nodes where there are several, so that overtaking is
+// possible. All must get the lock, whatever the order: overtaking has to stay bounded.
+template <class Lock>
+void test_writers_progress() {
+  std::vector<int> cpus;  // one CPU per node, then more of them
+  cpu_set_t allowed;
+  CHECK(sched_getaffinity(0, sizeof(allowed), &allowed) == 0);
+  for (int round = 0; round < 2; ++round) {
+    for (int node = 0; node < latch::runtime.m_node_count; ++node) {
+      int seen = 0;
+      for (int cpu = 0; cpu < latch::runtime.m_cpu_capacity; ++cpu) {
+        if (CPU_ISSET(cpu, &allowed) && latch::runtime.m_node_map[cpu] == node && seen++ == round) cpus.push_back(cpu);
+      }
+    }
+  }
+  Lock lock;
+  int shared = 0;
+  std::atomic<bool> stop{false};
+  std::vector<std::atomic<std::uint64_t>> counts(cpus.size());
+  std::vector<std::thread> writers;
+  for (std::size_t index = 0; index < cpus.size(); ++index) {
+    writers.emplace_back([&, index] {
+      cpu_set_t only;
+      CPU_ZERO(&only);
+      CPU_SET(cpus[index], &only);
+      (void)pthread_setaffinity_np(pthread_self(), sizeof(only), &only);
+      while (!stop.load(std::memory_order_relaxed)) {
+        lock.lock();
+        ++shared;
+        lock.unlock();
+        counts[index].fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+  std::this_thread::sleep_for(500ms);
+  stop.store(true);
+  for (auto& writer : writers) writer.join();
+  std::uint64_t total = 0;
+  std::uint64_t fewest = std::numeric_limits<std::uint64_t>::max();
+  for (const auto& count : counts) {
+    total += count.load();
+    fewest = std::min(fewest, count.load());
+  }
+  CHECK(static_cast<std::uint64_t>(shared) == total);
+  CHECK(fewest > 0);
+  CHECK(fewest * 1000 >= total);  // far looser than either order's real fairness
+}
+
+// Turns must go round the nodes whichever node usually holds the lock. Two threads on one
+// node keep it busy, so that node usually holds it when a turn is due. A thread on a second
+// node thinks for long enough that the first resumes after its turn, but is back in the queue
+// by the next one. If the choice follows the holder and not the last turn, the second node
+// gets every turn and the third almost none (measured 2000:1). This machine may not have
+// three nodes, but the mutex is told the node.
+void test_turns_reach_every_node() {
+  latch::BargingMutex mutex;
+  latch::NodeTicketLock nodes[3];
+  for (std::uint32_t index = 0; index < 3; ++index) {
+    nodes[index].m_local_limit = latch::runtime.m_run_bound;
+    nodes[index].m_node_index = index;
+  }
+  std::atomic<bool> stop{false};
+  std::atomic<std::uint64_t> counts[3]{};
+  const auto run = [&](std::uint32_t node) {
+    while (!stop.load(std::memory_order_relaxed)) {
+      mutex.lock(nodes[node]);
+      mutex.unlock();
+      counts[node].fetch_add(1, std::memory_order_relaxed);
+      if (node == 1) latch::n_pause(800);
+    }
+  };
+  std::vector<std::thread> threads;
+  threads.emplace_back(run, 0U);
+  threads.emplace_back(run, 0U);
+  threads.emplace_back(run, 1U);
+  threads.emplace_back(run, 2U);
+  std::this_thread::sleep_for(500ms);
+  stop.store(true);
+  for (auto& thread : threads) thread.join();
+  CHECK(counts[1].load() > 0);
+  CHECK(counts[2].load() * 20 >= counts[0].load());  // measured 1:2
 }
 
 template <class Lock>
@@ -333,6 +421,13 @@ void test_native() {
     waiter.join();
     CHECK(acquired.load() == 2);
   }
+
+  std::println("native: writers on every node make progress, in both orders");
+  test_writers_progress<latch::BasicRwLock<latch::Recursion::none, latch::Order::fifo>>();
+  test_writers_progress<latch::BargingRwLock>();
+
+  std::println("native: turns reach every node, whichever usually holds the lock");
+  test_turns_reach_every_node();
 
   std::println("native: a failed try_lock must not lose sight of a fast-path reader");
   {

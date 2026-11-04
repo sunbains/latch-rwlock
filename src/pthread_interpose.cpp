@@ -5,6 +5,9 @@
 // caller's lock (zero under every initializer) hold a pointer to the real one,
 // installed on first use. Attributes are honored in the attribute object we own;
 // process-shared locks are refused at init rather than silently broken.
+//
+// There is no template parameter to pass through pthread_rwlock_t, so each order is its
+// own library: liblatch_interpose.so is FIFO, liblatch_interpose_barging.so is not.
 #include <errno.h>
 #include <pthread.h>
 #include <time.h>
@@ -16,7 +19,7 @@
 
 #include "latch/rw_lock.hpp"
 
-using latch::RwLockCore;
+using RwLockCore = latch::RwLockCore<latch::default_order>;
 using latch::ThreadState;
 
 namespace {
@@ -69,7 +72,7 @@ static_assert(sizeof(AttrOverlay) <= sizeof(pthread_rwlockattr_t));
          deadline->tv_nsec < 1'000'000'000;
 }
 
-// Ticket queues cannot be abandoned, so timed acquisition polls the try path.
+// A queue cannot be abandoned, so timed acquisition polls the try path.
 int poll_deadline(auto attempt, clockid_t clock, const timespec* deadline) noexcept {
   int status = attempt();
   if (status != EBUSY) return status;
