@@ -13,7 +13,9 @@ option(LATCH_BUILD_TESTS "Build the tests" ${PROJECT_IS_TOP_LEVEL})
 option(LATCH_BUILD_INTERPOSER "Build the LD_PRELOAD pthread_rwlock library (not packaged)" ${PROJECT_IS_TOP_LEVEL})
 option(LATCH_TSAN "Instrument tests with ThreadSanitizer" OFF)
 
-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+option(LATCH_INSTALL "Generate install rules and packages" ${PROJECT_IS_TOP_LEVEL})
+
+if(PROJECT_IS_TOP_LEVEL AND NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
@@ -78,6 +80,10 @@ if(LATCH_BUILD_TESTS)
   endif()
 endif()
 
+if(NOT LATCH_INSTALL)
+  return()
+endif()
+
 # ---- Install: headers and find_package() support ------------------------------
 
 install(DIRECTORY include/latch DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.hpp")
@@ -125,4 +131,6 @@ set(CPACK_RPM_PACKAGE_AUTOREQ OFF)
 set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
   /usr/share/cmake /usr/include)
 
-include(CPack)
+if(PROJECT_IS_TOP_LEVEL)
+  include(CPack)
+endif()
