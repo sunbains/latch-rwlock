@@ -3,6 +3,7 @@
 // constructor, before the C++ runtime or the application has initialized.
 #pragma once
 
+#include <sched.h>
 #include <linux/membarrier.h>
 #include <linux/mempolicy.h>
 #include <pthread.h>
@@ -108,6 +109,26 @@ struct alignas(coherence_unit) BiasRow {
   alignas(coherence_unit) std::atomic<std::uint32_t> m_read_counts[bias_columns];
 };
 
+// Set on a thread between fork_prepare and the fork, when it holds every allocator
+// lock. An application's prepare handler can run in that window and reach this library,
+// so that thread must not wait for locks it holds itself.
+LATCH_SHARED_STATE [[gnu::tls_model("initial-exec")]] inline constinit thread_local bool holds_fork_locks = false;
+
+class ForkAwareGuard {
+ public:
+  explicit ForkAwareGuard(SpinLock& lock) noexcept : m_lock(holds_fork_locks ? nullptr : &lock) {
+    if (m_lock != nullptr) m_lock->lock();
+  }
+  ~ForkAwareGuard() {
+    if (m_lock != nullptr) m_lock->unlock();
+  }
+  ForkAwareGuard(const ForkAwareGuard&) = delete;
+  ForkAwareGuard& operator=(const ForkAwareGuard&) = delete;
+
+ private:
+  SpinLock* m_lock;
+};
+
 class BiasTable {
  public:
   [[nodiscard]] BiasRow* acquire_row() noexcept;
@@ -123,12 +144,13 @@ class BiasTable {
   void reset_after_fork(const BiasRow* keep) noexcept;
   void initialize() noexcept;
 
+  SpinLock m_lock;
+
  private:
   BiasRow* m_rows = nullptr;
   std::uint32_t* m_free_rows = nullptr;
   std::atomic<std::size_t> m_free_count{0};
   std::atomic<std::size_t> m_high_water{0};
-  SpinLock m_lock;
 };
 
 LATCH_SHARED_STATE inline constinit BiasTable bias_table;
@@ -177,11 +199,7 @@ class alignas(coherence_unit) ThreadState {
   }
 };
 
-#ifndef LATCH_TLS_MODEL
-#define LATCH_TLS_MODEL "initial-exec"  // define as "global-dynamic" for dlopen-heavy plugins
-#endif
-
-LATCH_SHARED_STATE [[gnu::tls_model(LATCH_TLS_MODEL)]] inline constinit thread_local ThreadState*
+LATCH_SHARED_STATE [[gnu::tls_model("initial-exec")]] inline constinit thread_local ThreadState*
     tls_thread_state = nullptr;
 
 [[gnu::cold]] inline ThreadState& register_current_thread() noexcept;
@@ -200,14 +218,24 @@ LATCH_SHARED_STATE [[gnu::tls_model(LATCH_TLS_MODEL)]] inline constinit thread_l
 
 namespace detail {
 
+// While initializing, the state is the pid of the process doing it.
 inline constexpr int runtime_uninitialized = 0;
-inline constexpr int runtime_initializing = 1;
-inline constexpr int runtime_ready = 2;
+inline constexpr int runtime_ready = -1;
 
 LATCH_SHARED_STATE inline constinit std::atomic<int> runtime_state{runtime_uninitialized};
+LATCH_SHARED_STATE inline constinit std::atomic<bool> atfork_registered{false};
 LATCH_SHARED_STATE inline constinit pthread_key_t thread_key{};
 LATCH_SHARED_STATE inline constinit std::atomic<std::uint32_t> next_unique_id{1};
 LATCH_SHARED_STATE inline constinit const int* kernel_node_ids = nullptr;
+
+// CPUs this process may run on, which a cpuset or affinity mask can make far fewer
+// than the machine has. Decides when threads outnumber CPUs.
+[[nodiscard]] inline int usable_cpu_count(int discovered) noexcept {
+  cpu_set_t allowed;
+  if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return discovered;
+  const int count = CPU_COUNT(&allowed);
+  return count > 0 ? std::min(count, discovered) : discovered;
+}
 
 [[nodiscard]] inline int eval_key(const char* name, int fallback) noexcept {
   const char* text = std::getenv(name);
@@ -224,22 +252,20 @@ LATCH_SHARED_STATE inline constinit const int* kernel_node_ids = nullptr;
 class BlockPool {
  public:
   [[nodiscard]] void* allocate(std::size_t size, int node) noexcept {
-    m_lock.lock();
+    const ForkAwareGuard guard(m_lock);
     void* block = m_free;
     if (block != nullptr) {
       m_free = *static_cast<void**>(block);
     } else {
       block = bump(size, node);
     }
-    m_lock.unlock();
     return block;
   }
 
   void release(void* block) noexcept {
-    m_lock.lock();
+    const ForkAwareGuard guard(m_lock);
     *static_cast<void**>(block) = m_free;
     m_free = block;
-    m_lock.unlock();
   }
 
   SpinLock m_lock;
@@ -334,18 +360,23 @@ inline void thread_exit_callback(void* value) noexcept {
 // allocator, so take them all to give the child a consistent view.
 inline void fork_prepare() noexcept {
   for_each_pool([](BlockPool& pool) { pool.m_lock.lock(); });
+  bias_table.m_lock.lock();
+  holds_fork_locks = true;
 }
-inline void fork_parent() noexcept {
+inline void release_fork_locks() noexcept {
+  holds_fork_locks = false;
+  bias_table.m_lock.unlock();
   for_each_pool([](BlockPool& pool) { pool.m_lock.unlock(); });
 }
+inline void fork_parent() noexcept { release_fork_locks(); }
 inline void fork_child() noexcept {
-  for_each_pool([](BlockPool& pool) { pool.m_lock.unlock(); });
+  release_fork_locks();
   // membarrier registration belongs to the address space, not inherited.
   if (runtime.m_asymmetric) {
     syscall(SYS_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0);
   }
-  // The other threads do not exist here. Their published read slots would
-  // otherwise block writers in the child forever.
+  // The other threads do not exist here. Their published read slots would otherwise
+  // block writers in the child forever, and their rows count as in use.
   ThreadState* self = tls_thread_state;
   bias_table.reset_after_fork(self != nullptr ? self->m_bias_row : nullptr);
 }
@@ -386,7 +417,7 @@ inline void initialize_runtime() noexcept {
                                             : (restriction_mask & (max_numa_nodes - 1)) + 1;
   runtime.m_node_map = topology.m_node_map;
   runtime.m_cpu_capacity = topology.m_cpu_capacity;
-  runtime.m_cpu_count = topology.m_cpu_count;
+  runtime.m_cpu_count = usable_cpu_count(topology.m_cpu_count);
   runtime.m_node_count = folded;
   // One top-level waiter per node at most, so one slot per node gives each its own.
   const std::uint32_t grant_slots = std::bit_ceil(static_cast<std::uint32_t>(folded));
@@ -415,7 +446,11 @@ inline void initialize_runtime() noexcept {
     diagnostic("Error: pthread_key_create failed\n");
     _exit(1);
   }
-  pthread_atfork(fork_prepare, fork_parent, fork_child);
+  // A child that took over initialization from its parent may inherit these already
+  // registered, and running the handlers twice would deadlock.
+  if (!atfork_registered.exchange(true, std::memory_order_relaxed)) {
+    pthread_atfork(fork_prepare, fork_parent, fork_child);
+  }
 
   if (runtime.m_verbose) {
     diagnostic("latch: nodes=%d pause_q8=%u patience=%u bias=%d asymmetric=%d placement=%d\n",
@@ -427,12 +462,19 @@ inline void initialize_runtime() noexcept {
 }  // namespace detail
 
 inline void ensure_runtime() noexcept {
-  int expected = detail::runtime_uninitialized;
-  if (detail::runtime_state.load(std::memory_order_acquire) == detail::runtime_ready) return;
-  if (!detail::runtime_state.compare_exchange_strong(expected, detail::runtime_initializing,
-                                             std::memory_order_acquire)) {
-    while (detail::runtime_state.load(std::memory_order_acquire) != detail::runtime_ready) cpu_pause();
-    return;
+  int state = detail::runtime_state.load(std::memory_order_acquire);
+  if (state == detail::runtime_ready) return;
+  const pid_t self = getpid();
+  for (;;) {
+    if (state == detail::runtime_ready) return;
+    if (state == self) {  // another thread of this process is on it
+      cpu_pause();
+      state = detail::runtime_state.load(std::memory_order_acquire);
+      continue;
+    }
+    // Uninitialized, or another process's pid: we forked while one of its threads was
+    // initializing. That thread does not exist here, so nobody else would finish.
+    if (detail::runtime_state.compare_exchange_weak(state, self, std::memory_order_acquire)) break;
   }
   detail::initialize_runtime();
   detail::runtime_state.store(detail::runtime_ready, std::memory_order_release);
@@ -466,7 +508,7 @@ inline void BiasTable::initialize() noexcept {
 
 inline BiasRow* BiasTable::acquire_row() noexcept {
   BiasRow* row = nullptr;
-  m_lock.lock();
+  const ForkAwareGuard guard(m_lock);
   if (const std::size_t free_count = m_free_count.load(std::memory_order_relaxed); free_count != 0) {
     row = &m_rows[m_free_rows[free_count - 1]];
     m_free_count.store(free_count - 1, std::memory_order_relaxed);
@@ -476,24 +518,25 @@ inline BiasRow* BiasTable::acquire_row() noexcept {
     // Seq-cst pairs with revoke's read of the high-water mark; see RwLockCore.
     m_high_water.store(next + 1, std::memory_order_seq_cst);
   }
-  m_lock.unlock();
   return row;  // nullptr: too many threads, this one just uses the slow path
 }
 
 inline void BiasTable::release_row(BiasRow* row) noexcept {
-  m_lock.lock();
+  const ForkAwareGuard guard(m_lock);
   const std::size_t free_count = m_free_count.load(std::memory_order_relaxed);
   m_free_rows[free_count] = static_cast<std::uint32_t>(row - m_rows);
   m_free_count.store(free_count + 1, std::memory_order_relaxed);
-  m_lock.unlock();
 }
 
 inline void BiasTable::reset_after_fork(const BiasRow* keep) noexcept {
   const std::size_t rows = m_high_water.load(std::memory_order_relaxed);
+  std::size_t free_count = 0;
   for (std::size_t index = 0; index < rows; ++index) {
     if (&m_rows[index] == keep) continue;
     for (auto& slot : m_rows[index].m_slots) slot.store(nullptr, std::memory_order_relaxed);
+    m_free_rows[free_count++] = static_cast<std::uint32_t>(index);
   }
+  m_free_count.store(free_count, std::memory_order_relaxed);
 }
 
 inline void heavy_fence() noexcept {

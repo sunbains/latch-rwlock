@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 #include "latch/rw_lock.hpp"
 
@@ -51,25 +52,26 @@ static_assert(sizeof(AttrOverlay) <= sizeof(pthread_rwlockattr_t));
   return inflate(lock);
 }
 
-[[nodiscard]] std::int64_t to_nanos(const timespec& time) noexcept {
-  return time.tv_sec * std::int64_t{1'000'000'000} + time.tv_nsec;
-}
-
-[[nodiscard]] std::int64_t now_nanos(clockid_t clock) noexcept {
+[[nodiscard]] timespec now_on(clockid_t clock) noexcept {
   timespec now{};
   clock_gettime(clock, &now);
-  return to_nanos(now);
+  return now;
 }
 
-// Ticket queues cannot be abandoned, so timed acquisition polls the try path.
+// Compared field by field: a deadline far in the future does not fit in nanoseconds.
+[[nodiscard]] bool has_passed(const timespec& deadline, const timespec& now) noexcept {
+  return now.tv_sec != deadline.tv_sec ? now.tv_sec > deadline.tv_sec : now.tv_nsec >= deadline.tv_nsec;
+}
+
+// Ticket queues cannot be abandoned, so timed acquisition polls the try path. Arguments
+// are checked first, even if the lock is free, as glibc does.
 int poll_deadline(auto attempt, clockid_t clock, const timespec* deadline) noexcept {
-  int status = attempt();
-  if (status != EBUSY) return status;
   if (clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC) return EINVAL;
   if (deadline == nullptr || deadline->tv_nsec < 0 || deadline->tv_nsec >= 1'000'000'000) return EINVAL;
-  const std::int64_t target = to_nanos(*deadline);
+  int status = attempt();
+  if (status != EBUSY) return status;
   for (long nap = 1'000;; nap = std::min(nap * 2, 1'000'000L)) {
-    if (now_nanos(clock) >= target) return ETIMEDOUT;
+    if (has_passed(*deadline, now_on(clock))) return ETIMEDOUT;
     latch::short_sleep(nap);
     status = attempt();
     if (status != EBUSY) return status;
@@ -90,9 +92,19 @@ int timed_write(pthread_rwlock_t* lock, clockid_t clock, const timespec* deadlin
   return poll_deadline([&] { return core->try_write_acquire(self); }, clock, deadline);
 }
 
+// An invalid tv_nsec passes through, for poll_deadline to refuse.
 [[nodiscard]] timespec relative_deadline(const timespec& relative) noexcept {
-  const std::int64_t target = now_nanos(CLOCK_MONOTONIC) + to_nanos(relative);
-  return timespec{static_cast<time_t>(target / 1'000'000'000), static_cast<long>(target % 1'000'000'000)};
+  if (relative.tv_nsec < 0 || relative.tv_nsec >= 1'000'000'000) return relative;
+  const timespec now = now_on(CLOCK_MONOTONIC);
+  timespec deadline{};
+  deadline.tv_nsec = now.tv_nsec + relative.tv_nsec;
+  const bool carry = deadline.tv_nsec >= 1'000'000'000;
+  if (carry) deadline.tv_nsec -= 1'000'000'000;
+  if (__builtin_add_overflow(now.tv_sec, relative.tv_sec, &deadline.tv_sec) ||
+      __builtin_add_overflow(deadline.tv_sec, time_t{carry}, &deadline.tv_sec)) {
+    deadline.tv_sec = std::numeric_limits<time_t>::max();
+  }
+  return deadline;
 }
 
 }  // namespace

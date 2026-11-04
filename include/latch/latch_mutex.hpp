@@ -197,8 +197,11 @@ class Mutex {
     const bool rotate = (++local.m_rotation % rotation_period) == 0;
     const std::uint32_t successor = m_owner_ticket + 1;
     GrantLine& line = grant(successor);
-    line.m_grant.store(successor, std::memory_order_release);
+    // Node lock first. Once the top lock goes, another node's thread can take it, release
+    // it and destroy the lock, and a new lock can be given this NodeState: a late store of
+    // a grant would corrupt that lock. Late reads are safe, as the memory is type-stable.
     local.m_grant.store(next, std::memory_order_release);
+    line.m_grant.store(successor, std::memory_order_release);
     if constexpr (parking_compiled) {
       // Touching the words after release is safe: instances are type-stable memory.
       std::atomic_signal_fence(std::memory_order_seq_cst);

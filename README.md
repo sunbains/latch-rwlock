@@ -21,8 +21,28 @@ with a writer waiting. Other nesting is refused: `lock()` or `lock_shared()` by 
 holding the write lock, or `lock()` by a thread holding a read lock, throws
 `std::system_error` with `std::errc::resource_deadlock_would_occur`. Nothing is acquired
 and what the thread held is unchanged, so this is safe through `std::unique_lock`,
-`std::shared_lock` and `std::lock_guard`. The `try_` forms return `false` instead. Code
-built with `-fno-exceptions` has no way to carry the error, so there the same misuse aborts.
+`std::shared_lock` and `std::lock_guard`. The `try_` forms return `false` instead, and the
+timed forms do so at once, as waiting cannot help. Nesting past 2^32 levels throws
+`std::errc::resource_unavailable_try_again`. Code built with `-fno-exceptions` has no way
+to carry these errors, so there the same calls abort.
+
+For a write lock that a thread can take again, use `latch::RecursiveRwLock`, which is
+`latch::BasicRwLock<latch::Recursion::write>`:
+
+```cpp
+latch::RecursiveRwLock lock;
+
+void inner() { std::unique_lock guard(lock); /* ... */ }
+void outer() { std::unique_lock guard(lock); inner(); }
+```
+
+Each `lock()` needs its own `unlock()`, and the lock stays exclusive until the last one.
+An `unlock()` from a thread that does not hold it is ignored with a warning while the lock
+is nested. Mixing read and write locks still throws. Do not wait on a
+`std::condition_variable_any` while nested, as it releases only one level. `RwLock` does
+not contain the depth counter or its checks: it is 8 bytes, against 16 here.
+
+A thread that exits holding the write lock leaves it locked for good, as with any mutex.
 
 By default a lock adjusts itself to the mix of reads and writes it observes. To fix its
 behavior instead, give the expected share of writes as a percentage:
@@ -77,7 +97,9 @@ find_package(latch-rwlock 1.0 REQUIRED)
 target_link_libraries(app PRIVATE latch::rwlock)
 ```
 
-Or use `add_subdirectory()`, or `cmake --install`.
+Or use `add_subdirectory()`, or `cmake --install`. As a subdirectory it adds no install
+rules unless you set `LATCH_INSTALL=ON`, and no packaging. To declare `latch::RwLock` in
+a header without the full definition, include `latch/fwd.hpp`, not `class RwLock;`.
 
 ## Running existing binaries
 
@@ -88,6 +110,10 @@ Or use `add_subdirectory()`, or `cmake --install`.
 ```sh
 LD_PRELOAD=build/liblatch_interpose.so ./your-program
 ```
+
+These locks are never recursive. A nested write returns `EDEADLK`, as does a read under a
+write or a write under a read, and nesting past 2^32 read levels returns `EAGAIN`. The timed
+forms check their arguments first, even if the lock is free, as glibc does.
 
 Process-shared locks are not supported, and `pthread_rwlock_init` returns `ENOTSUP` for
 them. A process-shared lock placed in shared memory without an attribute-carrying init
@@ -107,7 +133,7 @@ is not detected, so do not use the library with such programs.
 
 Spin counts are scaled by the measured cost of `PAUSE`, which varies widely across x86
 generations. All metadata comes from an mmap-backed type-stable pool, so
-the library cannot recurse into `malloc`, and an unlock may touch lock words after
+the library cannot recurse into `malloc`, and an unlock may read lock words after
 another thread has destroyed the lock.
 
 ### Costs
@@ -116,14 +142,14 @@ another thread has destroyed the lock.
   in the pool. Almost all of it is padding that keeps contended words apart.
 - Fairness is long-term, not FIFO. Admission control trades short-term order for
   throughput, and timed and try acquisitions poll rather than queue.
-- Mutable global state uses default visibility, so shared objects in a process share
-  one instance, even when built with `-fvisibility=hidden`. An object that hides these
+- Mutable global state uses default visibility, so shared libraries linked at startup
+  share one instance, even when built with `-fvisibility=hidden`. An object that hides these
   symbols with a linker version script gets its own instance and must not share locks
   with the rest of the process. The interposer is such an object, by design: it does
   not exchange lock objects with native users.
-- The thread pointer uses the `initial-exec` TLS model. Define
-  `LATCH_TLS_MODEL="global-dynamic"` for code loaded with `dlopen` if static TLS runs
-  out.
+- Code loaded with `dlopen` is not supported. Such code may not share this state, in
+  which case sharing a lock with it does not exclude, and the failure is silent. The thread
+  pointer also uses the `initial-exec` TLS model, which can stop such code from loading.
 
 ## Tuning
 
@@ -168,7 +194,7 @@ build-tsan/test_rwlock native
 
 build/rw_bench ALength=64 NCSLength=50 WCSLength=4 RCSLength=10 _Duration=3000 +96@5
 LD_PRELOAD=build/liblatch_interpose.so build/rw_bench ... +384@5
-build/rw_bench Lock=native ... +96@5
+build/rw_bench Lock=native ... +96@5                 # or Lock=recursive
 scripts/bench_matrix.py --out results.csv glibc= latch=build/liblatch_interpose.so
 ```
 

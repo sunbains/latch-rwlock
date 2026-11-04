@@ -10,9 +10,12 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <concepts>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <print>
@@ -23,6 +26,11 @@
 #include <vector>
 
 #include "latch/latch.hpp"
+
+// Compiles every member, and shows that plain locks do not carry the counter.
+template class latch::BasicRwLock<latch::Recursion::write>;
+static_assert(sizeof(latch::RwLock) == sizeof(void*));
+static_assert(sizeof(latch::RecursiveRwLock) > sizeof(latch::RwLock));
 
 namespace {
 
@@ -38,7 +46,8 @@ int failures = 0;
 
 using namespace std::chrono_literals;
 
-const unsigned cpu_count = std::thread::hardware_concurrency();
+const unsigned cpu_count = std::max(std::thread::hardware_concurrency(), 1U);
+const unsigned half_cpus = std::max(cpu_count / 2, 1U);
 
 // std::shared_lock etc. compile against the native type.
 static_assert(requires(latch::RwLock& lock) {
@@ -128,7 +137,30 @@ bool refused_as_deadlock(auto attempt) {
   return false;
 }
 
-void test_self_deadlock(latch::RwLock& lock) {
+// Runs body in a child process and returns its wait status.
+int status_of_child(auto body) {
+  const pid_t child = fork();
+  if (child == 0) {
+    body();
+    _exit(0);
+  }
+  int status = 0;
+  waitpid(child, &status, 0);
+  return status;
+}
+
+std::atomic<bool> fork_hook_enabled{false};
+
+void fork_prepare_hook() {
+  if (!fork_hook_enabled.exchange(false)) return;
+  latch::RwLock during_fork;  // allocates from the pools our own handler just locked
+  during_fork.lock();
+  during_fork.unlock();
+}
+
+template <class Lock>
+void test_self_deadlock(Lock& lock) {
+  constexpr bool recursive = std::same_as<Lock, latch::RecursiveRwLock>;
   const auto others_can = [&](auto attempt) {
     bool result = false;
     std::thread([&] { result = attempt(); }).join();
@@ -147,8 +179,12 @@ void test_self_deadlock(latch::RwLock& lock) {
 
   // Direct calls.
   lock.lock();
-  CHECK(refused_as_deadlock([&] { lock.lock(); }));
+  if constexpr (!recursive) {
+    CHECK(refused_as_deadlock([&] { lock.lock(); }));
+    CHECK(!lock.try_lock());
+  }
   CHECK(refused_as_deadlock([&] { lock.lock_shared(); }));
+  CHECK(!lock.try_lock_shared());
   CHECK(!others_can(try_read));  // the refusals left the write lock in place
   lock.unlock();
   CHECK(others_can(try_write));
@@ -160,12 +196,35 @@ void test_self_deadlock(latch::RwLock& lock) {
   lock.unlock_shared();
   CHECK(others_can(try_write));
 
-  // Guards: a refused inner guard must not release what the outer one holds.
+  if constexpr (recursive) {
+    // Every form nests, and the lock stays exclusive until the last unlock.
+    lock.lock();
+    lock.lock();
+    CHECK(lock.try_lock());
+    CHECK(lock.try_lock_for(1ms));
+    CHECK(lock.try_lock_until(std::chrono::steady_clock::now() + 1ms));
+    for (int level = 0; level < 4; ++level) {
+      lock.unlock();
+      CHECK(!others_can(try_read));
+      CHECK(!others_can(try_write));
+    }
+    lock.unlock();
+    CHECK(others_can(try_read));
+    CHECK(others_can(try_write));
+  }
+
+  // Guards: an inner guard, nested or refused, must not release what the outer one holds.
   {
     std::unique_lock outer(lock);
-    CHECK(refused_as_deadlock([&] { std::unique_lock inner(lock); }));
+    if constexpr (recursive) {
+      std::unique_lock inner(lock);
+      std::lock_guard innermost(lock);
+      CHECK(inner.owns_lock());
+    } else {
+      CHECK(refused_as_deadlock([&] { std::unique_lock inner(lock); }));
+      CHECK(refused_as_deadlock([&] { std::lock_guard inner(lock); }));
+    }
     CHECK(refused_as_deadlock([&] { std::shared_lock inner(lock); }));
-    CHECK(refused_as_deadlock([&] { std::lock_guard inner(lock); }));
     CHECK(outer.owns_lock());
     CHECK(!others_can(try_read));
   }
@@ -192,6 +251,183 @@ void test_native() {
     test_self_deadlock(adaptive);
     latch::RwLock no_fast_reads{latch::ExpectedWrites{100}};
     test_self_deadlock(no_fast_reads);
+    latch::RecursiveRwLock recursive;
+    test_self_deadlock(recursive);
+    latch::RecursiveRwLock recursive_no_fast_reads{latch::ExpectedWrites{100}};
+    test_self_deadlock(recursive_no_fast_reads);
+  }
+
+  std::println("native: a new thread is not mistaken for one that exited holding the lock");
+  {
+    latch::RecursiveRwLock lock;
+    for (int round = 0; round < 8; ++round) {
+      latch::RecursiveRwLock abandoned;
+      std::thread([&] { abandoned.lock(); }).join();
+      std::thread([&] {
+        CHECK(!abandoned.try_lock());  // this thread's state is likely the dead one's, reused
+        CHECK(!abandoned.try_lock_shared());
+      }).join();
+    }
+    lock.lock();
+    lock.unlock();
+  }
+
+  std::println("native: mismatched and wrong-thread unlocks under a nested write lock");
+  {
+    latch::RecursiveRwLock lock;
+    const auto others_can_read = [&] {
+      bool taken = false;
+      std::thread([&] {
+        taken = lock.try_lock_shared();
+        if (taken) lock.unlock_shared();
+      }).join();
+      return taken;
+    };
+    lock.lock();
+    lock.lock();
+    lock.unlock_shared();  // wrong call, but it must only take off one level
+    CHECK(!others_can_read());
+    lock.unlock();
+    CHECK(others_can_read());
+    lock.lock();  // and the next holder must not inherit a depth
+    lock.unlock();
+    CHECK(others_can_read());
+
+    lock.lock();
+    lock.lock();
+    std::thread([&] { lock.unlock(); }).join();  // ignored, with a warning
+    lock.unlock();
+    CHECK(!others_can_read());
+    lock.unlock();
+    CHECK(others_can_read());
+  }
+
+  std::println("native: nesting limits are refused, not wrapped");
+  {
+    const auto refused_as_limit = [](auto attempt) {
+      try {
+        attempt();
+      } catch (const std::system_error& error) {
+        return error.code() == std::errc::resource_unavailable_try_again;
+      }
+      return false;
+    };
+    constexpr std::uint32_t limit = std::numeric_limits<std::uint32_t>::max();
+    latch::RecursiveRwLock lock;
+    lock.lock();
+    // The depth follows the core pointer; test only, as reaching it takes too long.
+    auto* const depth = reinterpret_cast<std::atomic<std::uint32_t>*>(reinterpret_cast<char*>(&lock) + sizeof(void*));
+    depth->store(limit);
+    CHECK(refused_as_limit([&] { lock.lock(); }));
+    CHECK(!lock.try_lock());
+    depth->store(0);
+    lock.unlock();
+
+    latch::ThreadState& self = latch::current_thread();
+    const auto check_read_limit = [&](latch::RwLock& readers) {
+      latch::ReadMemo* const memo = self.find_memo(&readers.core());
+      if (memo != nullptr) {
+        memo->m_count = limit;
+      } else {
+        for (auto& nesting : self.m_bias_nesting) nesting = limit;
+      }
+      CHECK(refused_as_limit([&] { readers.lock_shared(); }));
+      CHECK(!readers.try_lock_shared());
+      if (memo != nullptr) {
+        memo->m_count = 1;
+      } else {
+        for (auto& nesting : self.m_bias_nesting) nesting = 0;
+      }
+    };
+    latch::RwLock slow_reads{latch::ExpectedWrites{100}};  // never biased, so always the memo
+    slow_reads.lock_shared();
+    check_read_limit(slow_reads);
+    slow_reads.unlock_shared();
+    latch::RwLock fast_reads;
+    fast_reads.lock_shared();  // the first read is slow and enables the bias
+    fast_reads.unlock_shared();
+    fast_reads.lock_shared();  // this one is fast, if the bias is on
+    check_read_limit(fast_reads);
+    fast_reads.unlock_shared();
+  }
+
+  std::println("native: timed acquisition does not wait out a hold of this thread's own");
+  {
+    latch::RwLock lock;
+    const auto started = std::chrono::steady_clock::now();
+    lock.lock_shared();
+    CHECK(!lock.try_lock_for(30s));
+    lock.unlock_shared();
+    lock.lock();
+    CHECK(!lock.try_lock_for(30s));
+    CHECK(!lock.try_lock_shared_for(30s));
+    lock.unlock();
+    CHECK(std::chrono::steady_clock::now() - started < 10s);
+  }
+
+  std::println("native: fork");
+  {
+    // Registered rows of threads that do not exist in the child must not count as in use.
+    latch::RwLock lock;
+    std::atomic<bool> finish{false};
+    std::atomic<unsigned> registered{0};
+    std::vector<std::thread> threads;
+    for (unsigned index = 0; index < 32; ++index) {
+      threads.emplace_back([&] {
+        lock.lock_shared();
+        lock.unlock_shared();
+        registered.fetch_add(1);
+        while (!finish.load()) std::this_thread::sleep_for(1ms);
+      });
+    }
+    while (registered.load() < 32) std::this_thread::yield();
+    const int rows = status_of_child([&] {
+      if (latch::runtime.m_bias_enabled && latch::bias_table.rows_in_use() > 1) _exit(1);
+    });
+    CHECK(WIFEXITED(rows) && WEXITSTATUS(rows) == 0);
+    finish.store(true);
+    for (auto& thread : threads) thread.join();
+
+    // Threads registering and exiting across a fork: the child inherits no held table lock.
+    // Not under ThreadSanitizer, which cannot start threads after a multi-threaded fork.
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> churners;
+    for (unsigned index = 0; index < 4; ++index) {
+      churners.emplace_back([&] {
+        while (!stop.load()) {
+          std::thread([&] {
+            lock.lock_shared();
+            lock.unlock_shared();
+          }).join();
+        }
+      });
+    }
+    for (int round = 0; round < (LATCH_TSAN ? 0 : 200); ++round) {
+      const int churned = status_of_child([&] {
+        alarm(20);
+        std::thread([&] {
+          lock.lock_shared();
+          lock.unlock_shared();
+        }).join();
+      });
+      CHECK(WIFEXITED(churned) && WEXITSTATUS(churned) == 0);
+    }
+    stop.store(true);
+    for (auto& thread : churners) thread.join();
+
+    // An application's prepare handler, registered first and so run after ours, can use a lock.
+    fork_hook_enabled.store(true);
+    const int hooked = status_of_child([&] {
+      alarm(20);
+      fork_hook_enabled.store(true);
+      const pid_t grandchild = fork();
+      if (grandchild == 0) _exit(0);
+      int status = 0;
+      waitpid(grandchild, &status, 0);
+      if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) _exit(1);
+    });
+    fork_hook_enabled.store(false);
+    CHECK(WIFEXITED(hooked) && WEXITSTATUS(hooked) == 0);
   }
 
   std::println("native: a failed try_lock must not lose sight of a fast-path reader");
@@ -255,6 +491,38 @@ void test_native() {
     std::this_thread::sleep_for(500ms);
     stop.store(true);
     for (auto& thread : threads) thread.join();
+  }
+
+  std::println("native: recursive writers exclude each other and readers");
+  {
+    latch::RecursiveRwLock lock;
+    std::uint64_t outer_count = 0;  // plain on purpose: ThreadSanitizer checks the exclusion
+    std::uint64_t inner_count = 0;
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> threads;
+    for (unsigned index = 0; index < std::max(cpu_count / 2, 4U); ++index) {
+      threads.emplace_back([&, index] {
+        const int depth = static_cast<int>(index % 3) + 1;
+        while (!stop.load(std::memory_order_relaxed)) {
+          if (index % 2 == 0) {
+            std::shared_lock guard(lock);
+            CHECK(outer_count == inner_count);
+          } else {
+            std::unique_lock guard(lock);
+            ++outer_count;
+            for (int level = 0; level < depth; ++level) lock.lock();
+            for (int level = 0; level < depth; ++level) lock.unlock();
+            CHECK(outer_count == inner_count + 1);  // still exclusive after the inner unlocks
+            ++inner_count;
+          }
+        }
+      });
+    }
+    std::this_thread::sleep_for(500ms);
+    stop.store(true);
+    for (auto& thread : threads) thread.join();
+    CHECK(outer_count > 0);
+    CHECK(outer_count == inner_count);
   }
 
   std::println("native: guards");
@@ -344,12 +612,14 @@ void test_native() {
   std::println("native: thread churn recycles reader rows");
   {
     latch::RwLock lock;
+    const std::size_t rows_before = latch::bias_table.high_water();
     for (int round = 0; round < 2000; ++round) {
       std::thread([&] {
         lock.lock_shared();
         lock.unlock_shared();
       }).join();
     }
+    CHECK(latch::bias_table.high_water() <= rows_before + 1);
     lock.lock();
     lock.unlock();
   }
@@ -399,12 +669,15 @@ void test_native() {
     for (auto& writer : writers) writer.join();
   }
 
+  // Bias=0, ExpectedWrites=n or -DLATCH_BIAS=0 turn automatic adjustment off.
+  const bool adaptive_compiled_in = latch::RwLock{}.core().is_adaptive();
+
   std::println("native: fixed configuration");
   {
     using latch::ExpectedWrites;
     using latch::LoadProfile;
     latch::RwLock adaptive;
-    CHECK(adaptive.core().is_adaptive());
+    if (adaptive_compiled_in) CHECK(adaptive.core().is_adaptive());
     CHECK(adaptive.core().load_profile() == LoadProfile::read_mostly);
     latch::RwLock light{ExpectedWrites{1}};
     CHECK(!light.core().is_adaptive());
@@ -420,13 +693,13 @@ void test_native() {
       light.unlock();
     }
     CHECK(light.core().load_profile() == LoadProfile::read_mostly);
-    exclusion_stress(light, cpu_count / 2, 50, 200ms);
-    exclusion_stress(heavy, cpu_count / 2, 1, 200ms);
+    exclusion_stress(light, half_cpus, 50, 200ms);
+    exclusion_stress(heavy, half_cpus, 1, 200ms);
     CHECK(heavy.core().load_profile() == LoadProfile::write_heavy);
   }
 
   std::println("native: automatic adjustment follows the load in both directions");
-  {
+  if (adaptive_compiled_in) {
     using latch::LoadProfile;
     latch::RwLock lock;
     const auto run_mix = [&lock](int write_pct, std::chrono::milliseconds duration) {
@@ -458,8 +731,19 @@ void test_native() {
   }
 
   std::println("native: more threads than CPUs always selects read-mostly");
-  {
+  if (adaptive_compiled_in) {
+    using latch::LoadProfile;
     latch::RwLock lock;
+    const auto wait_for_profile = [&](LoadProfile wanted, auto work) {
+      const auto deadline = std::chrono::steady_clock::now() + 20s;
+      while (lock.core().load_profile() != wanted && std::chrono::steady_clock::now() < deadline) work();
+      return lock.core().load_profile() == wanted;
+    };
+    // Away from the initial profile first, or finding read-mostly would prove nothing.
+    CHECK(wait_for_profile(LoadProfile::write_heavy, [&] {
+      lock.lock();
+      lock.unlock();
+    }));
     std::atomic<bool> stop{false};
     std::vector<std::thread> threads;
     for (unsigned id = 0; id < cpu_count * 2; ++id) {
@@ -470,16 +754,16 @@ void test_native() {
         }
       });
     }
-    std::this_thread::sleep_for(500ms);
+    // While they run: as threads exit, write-heavy becomes the right answer again.
+    CHECK(wait_for_profile(LoadProfile::read_mostly, [] { std::this_thread::sleep_for(10ms); }));
     stop.store(true);
     for (auto& thread : threads) thread.join();
-    CHECK(lock.core().load_profile() == latch::LoadProfile::read_mostly);
   }
 
   std::println("native: stress and oversubscription");
   for (const int write_pct : {0, 1, 10, 50, 100}) {
     latch::RwLock lock;
-    exclusion_stress(lock, cpu_count / 2, write_pct, 500ms);
+    exclusion_stress(lock, half_cpus, write_pct, 500ms);
     exclusion_stress(lock, cpu_count * 2, write_pct, 500ms);
     exclusion_stress(lock, cpu_count * 4, write_pct, 500ms);
   }
@@ -632,6 +916,8 @@ void test_pthread() {
         if (pthread_rwlock_wrlock(&fresh) != 0 || pthread_rwlock_unlock(&fresh) != 0) _exit(3);
       }
       if (pthread_rwlock_wrlock(&other.m_lock) != 0) _exit(4);
+      // The parent's reader does not exist here, so its slot must not block a writer.
+      if (pthread_rwlock_wrlock(&shared_lock.m_lock) != 0) _exit(5);
       _exit(0);
     }
     int status = 0;
@@ -639,6 +925,26 @@ void test_pthread() {
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     hold.store(false);
     reader.join();
+  }
+
+  std::println("pthread: timed forms check arguments first, and take any deadline");
+  {
+    PosixLock posix;
+    timespec soon = deadline_in(CLOCK_MONOTONIC, 1000);
+    CHECK(pthread_rwlock_clockrdlock(&posix.m_lock, CLOCK_PROCESS_CPUTIME_ID, &soon) == EINVAL);
+    CHECK(pthread_rwlock_clockwrlock(&posix.m_lock, CLOCK_PROCESS_CPUTIME_ID, &soon) == EINVAL);
+    CHECK(pthread_rwlock_wrlock(&posix.m_lock) == 0);
+    std::atomic<int> status{-1};
+    std::thread waiter([&] {
+      timespec far{std::numeric_limits<time_t>::max(), 0};
+      status.store(pthread_rwlock_timedrdlock(&posix.m_lock, &far));
+      if (status.load() == 0) pthread_rwlock_unlock(&posix.m_lock);
+    });
+    std::this_thread::sleep_for(50ms);
+    CHECK(status.load() == -1);  // a deadline that far off must not read as passed
+    CHECK(pthread_rwlock_unlock(&posix.m_lock) == 0);
+    waiter.join();
+    CHECK(status.load() == 0);
   }
 
   std::println("pthread: a failed trywrlock must not lose sight of a fast-path reader");
@@ -666,7 +972,7 @@ void test_pthread() {
   std::println("pthread: stress and oversubscription");
   for (const int write_pct : {0, 1, 10, 50, 100}) {
     PosixLock posix;
-    exclusion_stress(posix, cpu_count / 2, write_pct, 500ms);
+    exclusion_stress(posix, half_cpus, write_pct, 500ms);
     exclusion_stress(posix, cpu_count * 4, write_pct, 500ms);
   }
   {
@@ -679,6 +985,7 @@ void test_pthread() {
 
 int main(int argc, char* argv[]) {
   setbuf(stdout, nullptr);
+  pthread_atfork(fork_prepare_hook, nullptr, nullptr);  // before the library's handlers
   alarm(600);  // a deadlock must not wedge the run
   const std::string_view mode = argc > 1 ? argv[1] : "native";
   if (mode == "pthread") {
