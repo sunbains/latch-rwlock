@@ -84,7 +84,6 @@ enum class LockMode : std::uint32_t {
 class alignas(coherence_unit) RwLockCore {
  public:
   RwLockCore() noexcept {
-    ensure_runtime();
     if (runtime.m_expected_writes >= 0) {
       fix_profile(static_cast<std::uint32_t>(runtime.m_expected_writes));
     } else {
@@ -116,10 +115,18 @@ class alignas(coherence_unit) RwLockCore {
   }
 
   [[nodiscard]] static RwLockCore* create() noexcept {
-    return new (pool_allocate(PoolKind::lock_core, sizeof(RwLockCore))) RwLockCore{};
+    ensure_runtime();
+    return new (pool_allocate(PoolKind::lock_core, allocation_size())) RwLockCore{};
   }
   [[nodiscard]] static RwLockCore* create(ExpectedWrites expected) noexcept {
-    return new (pool_allocate(PoolKind::lock_core, sizeof(RwLockCore))) RwLockCore{expected};
+    ensure_runtime();
+    return new (pool_allocate(PoolKind::lock_core, allocation_size())) RwLockCore{expected};
+  }
+
+  // Total memory of one lock, including its per-node state.
+  [[nodiscard]] static std::size_t footprint() noexcept {
+    ensure_runtime();
+    return allocation_size() + sizeof(NodeState) * static_cast<std::size_t>(runtime.m_node_count);
   }
 
   [[nodiscard]] LoadProfile load_profile() const noexcept {
@@ -187,7 +194,7 @@ class alignas(coherence_unit) RwLockCore {
       drain_readers();
     }
     if (m_bias.load(std::memory_order_relaxed) != 0) revoke_bias();
-    if (m_adaptive && (++m_writes % sample_write_interval) == 0) [[unlikely]] sample_load();
+    if (m_adaptive && (++m_write_mutex.m_holder.m_writes % sample_write_interval) == 0) [[unlikely]] sample_load();
     LATCH_CLAIM(m_writer_active.load(std::memory_order_relaxed) == 0);
     m_writer_active.store(reinterpret_cast<std::uintptr_t>(&self), std::memory_order_relaxed);
     return 0;
@@ -282,6 +289,8 @@ class alignas(coherence_unit) RwLockCore {
   }
 
  private:
+  [[nodiscard]] static std::size_t allocation_size() noexcept { return sizeof(RwLockCore) + Mutex::grant_bytes(); }
+
   // The row belongs to this thread and the counter has its own cache line, so this
   // is not a shared write. Atomic only because a sampling writer may read it.
   [[gnu::always_inline]] void count_read(BiasRow& row) const noexcept {
@@ -310,17 +319,17 @@ class alignas(coherence_unit) RwLockCore {
   // process has many locks, which blends their counts: the estimate is approximate.
   [[gnu::noinline]] void sample_load() noexcept {
     const std::uint64_t now = read_clock();
-    if (now - m_sample_began < sample_interval_cycles) return;
-    m_sample_began = now;
+    if (now - m_write_mutex.m_holder.m_sample_began < sample_interval_cycles) return;
+    m_write_mutex.m_holder.m_sample_began = now;
     std::uint32_t reads = 0;
     const std::size_t rows = bias_table.high_water();
     for (std::size_t index = 0; index < rows; ++index) {
       reads += bias_table.row(index).m_read_counts[m_bias_column].load(std::memory_order_relaxed);
     }
-    const std::uint64_t read_delta = reads - m_sampled_reads;
-    const std::uint64_t write_delta = m_writes - m_sampled_writes;
-    m_sampled_reads = reads;
-    m_sampled_writes = m_writes;
+    const std::uint64_t read_delta = reads - m_write_mutex.m_holder.m_sampled_reads;
+    const std::uint64_t write_delta = m_write_mutex.m_holder.m_writes - m_write_mutex.m_holder.m_sampled_writes;
+    m_write_mutex.m_holder.m_sampled_reads = reads;
+    m_write_mutex.m_holder.m_sampled_writes = m_write_mutex.m_holder.m_writes;
     const std::uint64_t percent = write_delta * 100 / std::max<std::uint64_t>(read_delta + write_delta, 1);
     const LoadProfile current = m_profile.load(std::memory_order_relaxed);
     LoadProfile next = current;
@@ -588,11 +597,10 @@ class alignas(coherence_unit) RwLockCore {
 
   // Never written after construction: not invalidated by writer traffic.
   std::array<NodeState*, max_numa_nodes> m_nodes{};
-  bool m_adaptive = false;
 
   // Every reader reads this unit; writers write it. Readers only need it to be
   // current when a writer has been through, at which point they miss regardless.
-  alignas(coherence_unit) std::atomic<std::uintptr_t> m_writer_active{0};
+  alignas(light_unit) std::atomic<std::uintptr_t> m_writer_active{0};
   std::atomic<LockMode> m_mode{LockMode::reading};
   std::atomic<std::uint32_t> m_bias{0};
   std::atomic<std::uint32_t> m_drain_parked{0};
@@ -601,18 +609,15 @@ class alignas(coherence_unit) RwLockCore {
   std::atomic<std::uint32_t> m_group_patience{0};
   std::atomic<std::uint32_t> m_bias_allowed{1};
   std::atomic<LoadProfile> m_profile{LoadProfile::read_mostly};
+  bool m_adaptive = false;
 
-  Mutex m_write_mutex;
-
-  // Write mutex holder only.
-  alignas(coherence_unit) std::uint64_t m_sample_began = 0;
-  std::uint32_t m_writes = 0;
-  std::uint32_t m_sampled_writes = 0;
-  std::uint32_t m_sampled_reads = 0;
-
-  alignas(coherence_unit) std::atomic<std::uint32_t> m_read_arrive{0};
-  alignas(coherence_unit) std::atomic<std::uint32_t> m_read_depart{0};
+  // Reader groups. Separate units: sharing one saves little and cost 10% at 1-5% writes.
+  alignas(light_unit) std::atomic<std::uint32_t> m_read_arrive{0};
+  alignas(light_unit) std::atomic<std::uint32_t> m_read_depart{0};
   std::atomic<std::uint32_t> m_depart_parked{0};
+
+  // Must stay last: its grant slots follow it in memory.
+  Mutex m_write_mutex;
 };
 
 // Native interface. Meets the SharedTimedMutex requirements, so std::unique_lock

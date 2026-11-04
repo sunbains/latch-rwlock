@@ -24,6 +24,12 @@ find_package(Threads REQUIRED)
 add_library(latch_rwlock INTERFACE)
 add_library(latch::rwlock ALIAS latch_rwlock)
 target_compile_features(latch_rwlock INTERFACE cxx_std_26)
+# Header-only, so this reaches consumers through the target. Empty: use the compiler's
+# value for the target. A consumer using the installed package sets the macro itself.
+set(LATCH_CACHE_LINE_SIZE "" CACHE STRING "Cache line size in bytes; empty uses the compiler's value")
+if(LATCH_CACHE_LINE_SIZE)
+  target_compile_definitions(latch_rwlock INTERFACE LATCH_CACHE_LINE_SIZE=${LATCH_CACHE_LINE_SIZE})
+endif()
 target_link_libraries(latch_rwlock INTERFACE Threads::Threads)
 target_include_directories(latch_rwlock INTERFACE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

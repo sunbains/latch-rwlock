@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -33,6 +34,8 @@ class alignas(coherence_unit) Runtime {
   int m_cpu_capacity = 0;
   int m_node_count = 1;         // after folding, in [1, max_numa_nodes]
   int m_cpu_count = 1;
+  std::uint32_t m_grant_mask = 0;   // top-level grant slots - 1
+  std::uint32_t m_grant_shift = 0;  // log2 of the top-level grant slots
   int m_run_bound = 100;        // RunBound: fairness limit on local hand-off
   int m_patience = 2000;        // Patience: nominal pauses before parking; <0 spins
   std::uint32_t m_admission_limit = 8;  // AdmissionLimit: queue depth per node; 0 disables
@@ -385,6 +388,10 @@ inline void initialize_runtime() noexcept {
   runtime.m_cpu_capacity = topology.m_cpu_capacity;
   runtime.m_cpu_count = topology.m_cpu_count;
   runtime.m_node_count = folded;
+  // One top-level waiter per node at most, so one slot per node gives each its own.
+  const std::uint32_t grant_slots = std::bit_ceil(static_cast<std::uint32_t>(folded));
+  runtime.m_grant_mask = grant_slots - 1;
+  runtime.m_grant_shift = static_cast<std::uint32_t>(std::countr_zero(grant_slots));
   kernel_node_ids = topology.m_physical_node;
   runtime.m_node_placement = eval_key("NodePlacement", 0) != 0 && folded > 1;
 

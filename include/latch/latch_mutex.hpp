@@ -10,7 +10,9 @@
 
 #include <atomic>
 #include <bit>
+#include <cstddef>
 #include <cstdint>
+#include <new>
 
 #include "latch/futex.hpp"
 #include "latch/platform.hpp"
@@ -38,7 +40,7 @@ inline constexpr long gate_sleep_limit_ns = 100'000'000;
 
 // Node-local ticket lock. Request and grant normally get separate lines, but the
 // users of this instance are all on one node, so packing them is cheap.
-struct alignas(coherence_unit) NodeTicketLock {
+struct alignas(contended_unit) NodeTicketLock {
   std::atomic<std::uint32_t> m_request{0};
   std::atomic<std::uint32_t> m_grant{0};
   std::atomic<std::uint32_t> m_top_granted{0};  // top lock was passed along
@@ -105,8 +107,35 @@ inline void park_for_ticket(const std::atomic<std::uint32_t>& grant,
   parked.fetch_sub(1, std::memory_order_relaxed);
 }
 
+// The grant slots follow the object in memory, sized for this machine's node count:
+// construct only where grant_bytes() extra bytes are available (see RwLockCore).
 class Mutex {
+  // Each grant is the sole occupant of its line: a release wakes only the waiter
+  // polling this slot, instead of invalidating every waiter's cache.
+  struct alignas(contended_unit) GrantLine {
+    std::atomic<std::uint32_t> m_grant{0};
+    std::atomic<std::uint32_t> m_parked{0};
+  };
+
  public:
+  // Fields a user of the mutex keeps for its holder, so they need no unit of their own.
+  struct HolderState {
+    std::uint64_t m_sample_began = 0;
+    std::uint32_t m_writes = 0;
+    std::uint32_t m_sampled_writes = 0;
+    std::uint32_t m_sampled_reads = 0;
+  };
+
+  Mutex() noexcept {
+    for (std::uint32_t slot = 0; slot <= runtime.m_grant_mask; ++slot) new (&grant(slot)) GrantLine{};
+  }
+  Mutex(const Mutex&) = LATCH_DELETE("a lock has identity");
+  Mutex& operator=(const Mutex&) = LATCH_DELETE("a lock has identity");
+
+  [[nodiscard]] static std::size_t grant_bytes() noexcept {
+    return sizeof(GrantLine) * (std::size_t{runtime.m_grant_mask} + 1);
+  }
+
   // Returns true if the acquisition had to wait or came via local hand-off.
   bool lock(NodeTicketLock& local) noexcept {
     admit(local);
@@ -120,10 +149,10 @@ class Mutex {
     }
 
     const std::uint32_t ticket = m_request.fetch_add(1, std::memory_order_relaxed);
-    GrantLine& line = m_grants[ticket & (grant_slots - 1)];
+    GrantLine& line = grant(ticket);
     if constexpr (prefetchw_compiled) {
       // Our release will store to the next slot: fetch it with intent to write.
-      prefetch_for_write(&m_grants[(ticket + 1) & (grant_slots - 1)]);
+      prefetch_for_write(&grant(ticket + 1));
     }
     const bool contended = await_top(line, ticket);
     m_owner_ticket = ticket;
@@ -140,7 +169,7 @@ class Mutex {
     }
     // Node lock held, and nothing was queued, so no top-lock pass can be pending.
     std::uint32_t ticket = m_request.load(std::memory_order_acquire);
-    if (m_grants[ticket & (grant_slots - 1)].m_grant.load(std::memory_order_acquire) == ticket &&
+    if (grant(ticket).m_grant.load(std::memory_order_acquire) == ticket &&
         m_request.compare_exchange_strong(ticket, ticket + 1, std::memory_order_acquire,
                                           std::memory_order_relaxed)) {
       m_owner_ticket = ticket;
@@ -167,7 +196,7 @@ class Mutex {
     local.m_local_limit = runtime.m_run_bound;
     const bool rotate = (++local.m_rotation % rotation_period) == 0;
     const std::uint32_t successor = m_owner_ticket + 1;
-    GrantLine& line = m_grants[successor & (grant_slots - 1)];
+    GrantLine& line = grant(successor);
     line.m_grant.store(successor, std::memory_order_release);
     local.m_grant.store(next, std::memory_order_release);
     if constexpr (parking_compiled) {
@@ -194,10 +223,9 @@ class Mutex {
   // May report a false "locked" while the state moves, never a false "unlocked".
   [[nodiscard]] bool is_locked() const noexcept {
     const std::uint32_t ticket = m_request.load(std::memory_order_acquire);
-    const std::uint32_t grant =
-        m_grants[ticket & (grant_slots - 1)].m_grant.load(std::memory_order_acquire);
+    const std::uint32_t granted = grant(ticket).m_grant.load(std::memory_order_acquire);
     const std::uint32_t verify = m_request.load(std::memory_order_acquire);
-    return ((ticket ^ verify) | (grant ^ ticket)) != 0;
+    return ((ticket ^ verify) | (granted ^ ticket)) != 0;
   }
 
   void wait_unlocked() const noexcept {
@@ -205,7 +233,7 @@ class Mutex {
     for (;;) {
       while (static_cast<std::int32_t>(
                  ticket -
-                 m_grants[ticket & (grant_slots - 1)].m_grant.load(std::memory_order_acquire)) > 0) {
+                 grant(ticket).m_grant.load(std::memory_order_acquire)) > 0) {
         cpu_pause();
       }
       const std::uint32_t verify = m_request.load(std::memory_order_acquire);
@@ -215,20 +243,10 @@ class Mutex {
   }
 
  private:
-  // Power of two, and no smaller than the number of nodes.
-  static constexpr std::uint32_t grant_slots = 8;
-  static_assert(std::has_single_bit(grant_slots) && grant_slots >= max_numa_nodes);
-
-  // Each grant is the sole occupant of its line: a release wakes only the waiter
-  // polling this slot, instead of invalidating every waiter's cache.
-  struct alignas(coherence_unit) GrantLine {
-    std::atomic<std::uint32_t> m_grant{0};
-    std::atomic<std::uint32_t> m_parked{0};
-  };
 
   // Low bits of a top ticket select the slot; the bits above select the waiter.
-  [[nodiscard]] static constexpr std::uint32_t top_bits(std::uint32_t ticket) noexcept {
-    return ticket_bits(ticket >> std::countr_zero(grant_slots));
+  [[nodiscard]] static std::uint32_t top_bits(std::uint32_t ticket) noexcept {
+    return ticket_bits(ticket >> runtime.m_grant_shift);
   }
 
   static void publish_local(NodeTicketLock& local, std::uint32_t next, bool rotate) noexcept {
@@ -290,10 +308,17 @@ class Mutex {
     return contended;
   }
 
-  alignas(coherence_unit) std::atomic<std::uint32_t> m_request{0};
-  GrantLine m_grants[grant_slots];
-  alignas(coherence_unit) std::uint32_t m_owner_ticket = 0;  // holder only
+  [[nodiscard]] GrantLine& grant(std::uint32_t ticket) const noexcept {
+    auto* const lines = reinterpret_cast<GrantLine*>(reinterpret_cast<char*>(const_cast<Mutex*>(this)) + sizeof(Mutex));
+    return lines[ticket & runtime.m_grant_mask];
+  }
+
+  alignas(contended_unit) std::atomic<std::uint32_t> m_request{0};
+  alignas(light_unit) std::uint32_t m_owner_ticket = 0;  // holder only
   NodeTicketLock* m_via = nullptr;  // node lock through which we hold the top
+
+ public:
+  HolderState m_holder;  // shares the holder-only unit
 };
 
 }  // namespace latch

@@ -68,10 +68,10 @@ template <FetchIncrementPolicy policy = fetch_policy>
 // Reader count, split into two monotonic counters. Arriving and departing readers
 // touch different words, which lowers CAS failures. Sequestered per node, so
 // readers on different nodes generate no inter-node coherence traffic.
-struct alignas(coherence_unit) ReaderIndicator {
+struct alignas(contended_unit) ReaderIndicator {
   std::atomic<std::uint32_t> m_ingress{0};
 #if LATCH_SPLIT_INDICATOR
-  alignas(coherence_unit)
+  alignas(contended_unit)
 #endif
   std::atomic<std::uint32_t> m_egress{0};
 

@@ -107,8 +107,8 @@ another thread has destroyed the lock.
 
 ### Costs
 
-- Each lock takes about 2.3 KiB with two NUMA nodes: 8 bytes in your object and the
-  rest in the pool.
+- Each lock takes 1,536 bytes with two NUMA nodes: 8 bytes in your object and the rest
+  in the pool. Almost all of it is padding that keeps contended words apart.
 - Fairness is long-term, not FIFO. Admission control trades short-term order for
   throughput, and timed and try acquisitions poll rather than queue.
 - Mutable global state uses default visibility, so shared objects in a process share
@@ -138,6 +138,20 @@ Environment variables, read once at start-up:
 
 Compile-time switches are in `include/latch/config.hpp`. The defaults were chosen by
 measurement with `scripts/ablation.sh`.
+
+## Cache line size
+
+The cache line size is fixed at compile time. It comes from
+`std::hardware_destructive_interference_size`, and `LATCH_CACHE_LINE_SIZE` overrides it,
+as a macro or as a CMake cache variable.
+
+One rule to know: because this is header-only, every part of a program that shares a lock
+must compile with the same value. Mismatched settings across shared libraries would be a
+real bug, and the compiler can't catch it.
+
+The socket count itself is still found at startup, since that depends on the machine a
+binary runs on rather than where it's built. So the grant slots are sized at runtime, but
+the cache-line size isn't.
 
 ## Build, test, benchmark
 

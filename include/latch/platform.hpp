@@ -6,8 +6,10 @@
 #include <time.h>
 
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <new>
 
 #include "latch/config.hpp"
 
@@ -35,13 +37,45 @@
 
 namespace latch {
 
-// Effective coherence unit. x86 lines are 64 bytes, but the adjacent-sector
-// prefetcher makes pairs of lines behave as one unit for false sharing.
-#if defined(__x86_64__) || defined(__i386__) || defined(__aarch64__)
-inline constexpr std::size_t coherence_unit = 128;
-#else
-inline constexpr std::size_t coherence_unit = 64;
+// Cache line size, fixed at compile time. Every translation unit and shared object
+// that shares a lock must see the same value, so a build should set this once
+// (LATCH_CACHE_LINE_SIZE, or the CMake cache variable of that name) if it differs from
+// what the compiler reports for the target.
+#ifdef LATCH_CACHE_LINE_SIZE
+inline constexpr std::size_t cache_line_size = LATCH_CACHE_LINE_SIZE;
+#elif defined(__cpp_lib_hardware_interference_size)
+#if !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winterference-size"
 #endif
+inline constexpr std::size_t cache_line_size = std::hardware_destructive_interference_size;
+#if !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+#else
+inline constexpr std::size_t cache_line_size = 64;
+#endif
+static_assert(std::has_single_bit(cache_line_size), "the cache line size must be a power of two");
+
+// Lines of separation. x86's adjacent-line prefetcher makes two lines behave as one
+// unit for false sharing, so by default separated words are two lines apart there.
+#ifndef LATCH_DEFAULT_LINES
+#if defined(__x86_64__) || defined(__i386__)
+#define LATCH_DEFAULT_LINES 2
+#else
+#define LATCH_DEFAULT_LINES 1
+#endif
+#endif
+#ifndef LATCH_CONTENDED_LINES
+#define LATCH_CONTENDED_LINES LATCH_DEFAULT_LINES  // words written by many CPUs in steady state
+#endif
+#ifndef LATCH_LIGHT_LINES
+#define LATCH_LIGHT_LINES LATCH_DEFAULT_LINES  // words that change far less often
+#endif
+
+inline constexpr std::size_t coherence_unit = cache_line_size * LATCH_DEFAULT_LINES;
+inline constexpr std::size_t contended_unit = cache_line_size * LATCH_CONTENDED_LINES;
+inline constexpr std::size_t light_unit = cache_line_size * LATCH_LIGHT_LINES;
 
 // Lock instances hold arrays indexed by NUMA node. Machines with more nodes
 // than this fold several nodes onto one index rather than refusing to start.
