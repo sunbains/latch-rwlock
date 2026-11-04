@@ -23,6 +23,8 @@ for name in "${!variants[@]}"; do
 done
 run() {  # label preload env-assignment...
   local label=$1 lib=$2; shift 2
+  # A missing library is ignored by ld.so, which would record glibc under this label.
+  if [[ ! -f "$lib" ]]; then echo "skipping $label: no $lib" >&2; return; fi
   for load in "96 0" "96 1" "96 5" "96 50" "384 5" "384 50" "8 50" "1 100"; do
     set -- "$@"; read -r threads pct <<<"$load"
     for rep in 1 2; do

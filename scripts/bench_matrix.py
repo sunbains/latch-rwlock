@@ -46,6 +46,12 @@ def main():
     parser.add_argument("--args", default="ALength=64 NCSLength=50 WCSLength=4 RCSLength=10")
     args = parser.parse_args()
 
+    # A missing library is ignored by ld.so, which would record glibc under this label.
+    for spec in args.locks:
+        library = spec.split("=", 1)[1].partition("@")[0]
+        if library and not os.path.isfile(library):
+            parser.error(f"no such library: {spec}")
+
     common = f"{args.args} _Duration={args.duration}"
     limit = args.duration / 1000 + 45
     with open(args.out, "w", newline="") as stream:
