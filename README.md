@@ -1,6 +1,6 @@
 # latch-rwlock
 
-A header-only, NUMA-aware reader-writer lock for C++26 on Linux, designed to keep
+A header-only, NUMA-aware reader-writer lock for C++23 on Linux, designed to keep
 working when threads outnumber CPUs. It is built around a NUMA-aware writer mutex and
 per-node reader indicators, with a per-thread visible-reader fast path, admission
 control, and spin-then-park waiting.

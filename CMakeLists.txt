@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 
 project(latch-rwlock
   VERSION 1.0.0
-  DESCRIPTION "Header-only NUMA-aware reader-writer lock for C++26"
+  DESCRIPTION "Header-only NUMA-aware reader-writer lock for C++23"
   LANGUAGES CXX)
 
 include(CMakePackageConfigHelpers)
@@ -25,7 +25,7 @@ find_package(Threads REQUIRED)
 
 add_library(latch_rwlock INTERFACE)
 add_library(latch::rwlock ALIAS latch_rwlock)
-target_compile_features(latch_rwlock INTERFACE cxx_std_26)
+target_compile_features(latch_rwlock INTERFACE cxx_std_23)
 # Header-only, so this reaches consumers through the target. Empty: use the compiler's
 # value for the target. A consumer using the installed package sets the macro itself.
 set(LATCH_CACHE_LINE_SIZE "" CACHE STRING "Cache line size in bytes; empty uses the compiler's value")

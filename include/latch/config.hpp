@@ -3,8 +3,8 @@
 // so its contribution can be measured. Defaults are selected by measurement.
 #pragma once
 
-#if __cplusplus <= 202302L
-#error "latch requires C++26 (-std=c++26)"
+#if __cplusplus < 202302L
+#error "latch requires C++23 (-std=c++23)"
 #endif
 
 #ifndef LATCH_BIAS
